@@ -25,6 +25,7 @@ jobs:
         run: go test -v -race ./...
 
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

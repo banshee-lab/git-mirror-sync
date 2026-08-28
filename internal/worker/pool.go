@@ -199,21 +199,17 @@ func (p *Pool) processJob(job syncJob) {
     Provider:       job.repo.Provider,
     Owner:          job.repo.Owner,
     Repo:           job.repo.Name,
-    SourceURL:      job.repo.CloneURL,
+    SourceURL:      matchedRepo.RemoteAddress,
     Timeout:        p.cfg.GitCommandTimeout,
     ForgejoDataDir: p.cfg.ForgejoDataDir,
     MatchedRepo:    matchedRepo,
-  }
-
-  // Use SSHURL if CloneURL is empty
-  if syncOpts.SourceURL == "" {
-    syncOpts.SourceURL = job.repo.SSHURL
   }
 
   cachePath, err := p.gitSyncer.SyncRepository(p.ctx, syncOpts)
   if err != nil {
     status = history.StatusError
     detail = fmt.Sprintf("Sync failed: %v", err)
+		slog.Error(detail)
     return
   }
 
@@ -238,6 +234,7 @@ func (p *Pool) processJob(job syncJob) {
       status = history.StatusError
       detail = fmt.Sprintf("Push failed: %v", err)
     }
+		slog.Error(detail)
     return
   }
 
