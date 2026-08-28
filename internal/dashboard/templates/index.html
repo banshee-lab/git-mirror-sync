@@ -1,0 +1,170 @@
+{{define "title"}}Sync Events — Forgejo Sync{{end}}
+
+{{define "content"}}
+<div class="space-y-6">
+    <!-- Header info banner -->
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-800">
+        <div>
+            <h1 class="text-2xl font-bold text-white tracking-tight">Sync Activity</h1>
+            <p class="text-sm text-slate-400 mt-0.5">Showing the last {{len .Events}} sync events (newest first)</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <a href="/" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-smooth">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+                Refresh
+            </a>
+        </div>
+    </div>
+
+    {{if not .Events}}
+    <!-- Empty state -->
+    <div class="text-center py-16 px-4 rounded-xl border border-dashed border-slate-800 bg-slate-900/40">
+        <svg class="mx-auto h-12 w-12 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+        </svg>
+        <h3 class="mt-3 text-base font-semibold text-slate-300">No sync events recorded yet</h3>
+        <p class="mt-1 text-sm text-slate-500">Incoming webhooks from configured providers will appear here in real-time.</p>
+    </div>
+    {{else}}
+
+    <!-- Desktop Table View (hidden on small screens, shown on md and larger) -->
+    <div class="hidden md:block overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60 shadow-xl">
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm text-slate-300">
+                <thead class="bg-slate-800/80 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-700/60">
+                    <tr>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Status</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Time</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Provider / Repo</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Ref</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Commits (Before &rarr; After)</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Duration</th>
+                        <th scope="col" class="py-3.5 px-4 font-semibold">Detail</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/60">
+                    {{range .Events}}
+                    <tr class="hover:bg-slate-800/40 transition-smooth">
+                        <!-- Status Badge -->
+                        <td class="py-3.5 px-4 whitespace-nowrap">
+                            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase tracking-wider border {{statusBadgeClass .Status}}">
+                                {{.Status}}
+                            </span>
+                        </td>
+                        <!-- Received At -->
+                        <td class="py-3.5 px-4 whitespace-nowrap text-xs text-slate-400 font-mono">
+                            {{formatTime .ReceivedAt}}
+                        </td>
+                        <!-- Provider & Repository -->
+                        <td class="py-3.5 px-4">
+                            <div class="font-medium text-slate-200">{{.RepoFullName}}</div>
+                            <div class="text-xs text-slate-400 flex items-center gap-1.5 mt-0.5">
+                                <span class="capitalize px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700/60 font-mono text-[11px]">{{.Provider}}</span>
+                                {{if .ForgejoRepo}}
+                                <span class="text-slate-500">&rarr;</span>
+                                <span class="text-indigo-400">{{.ForgejoOwner}}/{{.ForgejoRepo}}</span>
+                                {{end}}
+                            </div>
+                        </td>
+                        <!-- Ref -->
+                        <td class="py-3.5 px-4 whitespace-nowrap font-mono text-xs text-slate-300">
+                            {{if .Ref}}
+                                <span class="px-2 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700/50">{{.Ref}}</span>
+                            {{else}}
+                                <span class="text-slate-600">—</span>
+                            {{end}}
+                        </td>
+                        <!-- Commits -->
+                        <td class="py-3.5 px-4 whitespace-nowrap font-mono text-xs text-slate-400">
+                            {{if or .CommitBefore .CommitAfter}}
+                                <span class="text-slate-300">{{formatCommit .CommitBefore}}</span>
+                                <span class="text-slate-600 mx-1">&rarr;</span>
+                                <span class="text-slate-300">{{formatCommit .CommitAfter}}</span>
+                            {{else}}
+                                <span class="text-slate-600">—</span>
+                            {{end}}
+                        </td>
+                        <!-- Duration -->
+                        <td class="py-3.5 px-4 whitespace-nowrap font-mono text-xs text-slate-400">
+                            {{formatDuration .DurationMS}}
+                        </td>
+                        <!-- Detail / Logs -->
+                        <td class="py-3.5 px-4 text-xs">
+                            {{if .Detail}}
+                                <div class="max-w-xs xl:max-w-md truncate text-slate-400 font-mono" title="{{.Detail}}">
+                                    {{truncateDetail .Detail}}
+                                </div>
+                            {{else}}
+                                <span class="text-slate-600">—</span>
+                            {{end}}
+                        </td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Mobile Card View (shown on small screens, hidden on md and larger) -->
+    <div class="block md:hidden space-y-4">
+        {{range .Events}}
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 shadow-lg">
+            <!-- Header: Status + Time -->
+            <div class="flex items-center justify-between">
+                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase tracking-wider border {{statusBadgeClass .Status}}">
+                    {{.Status}}
+                </span>
+                <span class="text-xs text-slate-400 font-mono">{{formatTime .ReceivedAt}}</span>
+            </div>
+
+            <!-- Repo info -->
+            <div>
+                <div class="font-medium text-white text-base">{{.RepoFullName}}</div>
+                <div class="text-xs text-slate-400 flex items-center gap-1.5 mt-1">
+                    <span class="capitalize px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700/60 font-mono">{{.Provider}}</span>
+                    {{if .ForgejoRepo}}
+                    <span class="text-slate-500">&rarr;</span>
+                    <span class="text-indigo-400">{{.ForgejoOwner}}/{{.ForgejoRepo}}</span>
+                    {{end}}
+                </div>
+            </div>
+
+            <!-- Ref & Commits -->
+            <div class="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-800/80 font-mono">
+                <div>
+                    <span class="text-slate-500 block">Ref:</span>
+                    <span class="text-slate-300 break-all">{{if .Ref}}{{.Ref}}{{else}}—{{end}}</span>
+                </div>
+                <div>
+                    <span class="text-slate-500 block">Duration:</span>
+                    <span class="text-slate-300">{{formatDuration .DurationMS}}</span>
+                </div>
+                <div class="col-span-2">
+                    <span class="text-slate-500 block">Commits:</span>
+                    {{if or .CommitBefore .CommitAfter}}
+                        <span class="text-slate-300">{{formatCommit .CommitBefore}}</span>
+                        <span class="text-slate-600 mx-1">&rarr;</span>
+                        <span class="text-slate-300">{{formatCommit .CommitAfter}}</span>
+                    {{else}}
+                        <span class="text-slate-600">—</span>
+                    {{end}}
+                </div>
+            </div>
+
+            <!-- Detail / Logs -->
+            {{if .Detail}}
+            <div class="pt-2 border-t border-slate-800/80">
+                <span class="text-xs text-slate-500 block mb-1 font-sans">Detail:</span>
+                <div class="p-2 rounded bg-slate-950/80 text-xs font-mono text-slate-400 break-words max-h-24 overflow-y-auto">
+                    {{.Detail}}
+                </div>
+            </div>
+            {{end}}
+        </div>
+        {{end}}
+    </div>
+    {{end}}
+</div>
+{{end}}
