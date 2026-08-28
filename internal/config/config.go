@@ -24,6 +24,7 @@ type Config struct {
 	ForgejoDBPassword      string
 	ForgejoDBName          string
 	ForgejoDBSSLMode       string
+	ForgejoSecret					 string
 	WebhookListenAddr      string
 	WebhookGitHubSecret    string
 	WebhookGitLabSecret    string
@@ -81,10 +82,10 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 	cfg.ForgejoDBPassword = getRequired("FORGEJO_DB_PASSWORD")
 	cfg.ForgejoDBName = getRequired("FORGEJO_DB_NAME")
 	cfg.ForgejoDBSSLMode = getRequired("FORGEJO_DB_SSLMODE")
-
+	cfg.ForgejoSecret = getRequired("FORGEJO_SECRET_KEY")
 	cfg.WebhookListenAddr = getRequired("WEBHOOK_LISTEN_ADDR")
-	cfg.WebhookGitHubSecret = getRequired("WEBHOOK_GITHUB_SECRET")
-	cfg.WebhookGitLabSecret = getRequired("WEBHOOK_GITLAB_SECRET")
+	cfg.WebhookGitHubSecret = strings.TrimSpace(getenv("WEBHOOK_GITHUB_SECRET"))
+	cfg.WebhookGitLabSecret = strings.TrimSpace(getenv("WEBHOOK_GITLAB_SECRET"))
 
 	// HISTORY_DB_PATH (optional, defaults to filepath.Join(CACHE_DIR, "history.db"))
 	historyDBPath := strings.TrimSpace(getenv("HISTORY_DB_PATH"))

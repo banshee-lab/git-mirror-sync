@@ -24,6 +24,7 @@ type SyncOptions struct {
 	Timeout        time.Duration
 	ForgejoDataDir string
 	MatchedRepo    *forgejodb.MatchedRepo
+	ForgejoSecret  string
 }
 
 // GetCachePath returns the bare mirror cache path: <CACHE_DIR>/{provider}/{owner}/{repo}.git
@@ -75,7 +76,7 @@ func SyncRepository(ctx context.Context, opts SyncOptions) (string, error) {
 
 	if IsSSHRemote(sourceURL) {
 		if sshCmd == "" && opts.MatchedRepo != nil {
-			creds, err := ResolveSSHCredentials(opts.CacheDir, opts.MatchedRepo)
+			creds, err := ResolveSSHCredentials(opts.CacheDir, opts.MatchedRepo, opts.ForgejoSecret)
 			if err != nil {
 				return "", fmt.Errorf("failed to resolve SSH credentials: %w", err)
 			}

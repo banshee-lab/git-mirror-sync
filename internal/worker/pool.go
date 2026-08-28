@@ -203,6 +203,7 @@ func (p *Pool) processJob(job syncJob) {
     Timeout:        p.cfg.GitCommandTimeout,
     ForgejoDataDir: p.cfg.ForgejoDataDir,
     MatchedRepo:    matchedRepo,
+		ForgejoSecret:  p.cfg.ForgejoSecret,
   }
 
   cachePath, err := p.gitSyncer.SyncRepository(p.ctx, syncOpts)

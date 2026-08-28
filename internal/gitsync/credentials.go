@@ -38,7 +38,7 @@ type SSHCredentials struct {
 
 // ResolveSSHCredentials writes the private key from the matched push mirror to a 0600 temp file
 // under <cacheDir>/.ssh-keys/key-*.
-func ResolveSSHCredentials(cacheDir string, repo *forgejodb.MatchedRepo) (*SSHCredentials, error) {
+func ResolveSSHCredentials(cacheDir string, repo *forgejodb.MatchedRepo, secret string) (*SSHCredentials, error) {
 	if repo == nil {
 		return nil, errors.New("matched repo cannot be nil")
 	}
@@ -67,7 +67,11 @@ func ResolveSSHCredentials(cacheDir string, repo *forgejodb.MatchedRepo) (*SSHCr
 		return nil, fmt.Errorf("failed to set permissions on ssh key file: %w", err)
 	}
 
-	keyData := repo.PrivateKey
+	keyData, err := DecryptForgejoSecret(secret, repo.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt private key: %w", err)
+	}
+
 	// Ensure newline at the end if not present
 	if len(keyData) > 0 && !bytes.HasSuffix(keyData, []byte("\n")) {
 		keyData = append(keyData, '\n')

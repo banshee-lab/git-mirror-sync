@@ -2,8 +2,13 @@ package gitsync
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,53 +97,97 @@ func TestExtractHTTPCredentials(t *testing.T) {
 		t.Errorf("expected unchanged URL, got %q", fallbackURL)
 	}
 }
-
 func TestResolveSSHCredentials(t *testing.T) {
-	tempCache := t.TempDir()
-	fakeKey := []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-data\n-----END OPENSSH PRIVATE KEY-----")
+  tempCache := t.TempDir()
+  plainKey := []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-data\n-----END OPENSSH PRIVATE KEY-----\n")
 
-	repo := &forgejodb.MatchedRepo{
-		RepoID:        1,
-		OwnerName:     "alice",
-		RepoName:      "project",
-		PrivateKey:    fakeKey,
-		RemoteAddress: "git@github.com:alice/project.git",
-	}
+  // If your implementation of DecryptForgejoSecret expects actual encrypted bytes (AES-CFB + base64),
+  // you can encrypt the plainKey for testing, or if your implementation handles unencrypted fallbacks/mocks 
+  // during tests, pass a valid test secret. 
+  // For this test, we assume your decryption handles the key or you can use a test helper:
+  testSecret := "my-test-secret-key-1234567890123456" // 32 bytes for AES-256
+  
+  // If you want to test the full encryption/decryption roundtrip in the test:
+  encryptedKey, err := EncryptForgejoSecretForTest(testSecret, plainKey)
+  if err != nil {
+    t.Fatalf("failed to prepare encrypted test key: %v", err)
+  }
 
-	creds, err := ResolveSSHCredentials(tempCache, repo)
-	if err != nil {
-		t.Fatalf("ResolveSSHCredentials failed: %v", err)
-	}
+  repo := &forgejodb.MatchedRepo{
+    RepoID:        1,
+    OwnerName:     "alice",
+    RepoName:      "project",
+    PrivateKey:    encryptedKey,
+    RemoteAddress: "git@github.com:alice/project.git",
+  }
 
-	if creds.KeyPath == "" {
-		t.Fatal("expected non-empty key path")
-	}
+  // Pass the secret key as the third parameter to match your updated signature
+  creds, err := ResolveSSHCredentials(tempCache, repo, testSecret)
+  if err != nil {
+    t.Fatalf("ResolveSSHCredentials failed: %v", err)
+  }
 
-	stat, err := os.Stat(creds.KeyPath)
-	if err != nil {
-		t.Fatalf("failed to stat temp key: %v", err)
-	}
-	if stat.Mode().Perm() != 0600 {
-		t.Errorf("expected file mode 0600, got %v", stat.Mode().Perm())
-	}
+  if creds.KeyPath == "" {
+    t.Fatal("expected non-empty key path")
+  }
 
-	data, err := os.ReadFile(creds.KeyPath)
-	if err != nil {
-		t.Fatalf("failed to read key file: %v", err)
-	}
-	if !strings.Contains(string(data), "fake-key-data") {
-		t.Errorf("key file content missing expected data: %s", string(data))
-	}
+  stat, err := os.Stat(creds.KeyPath)
+  if err != nil {
+    t.Fatalf("failed to stat temp key: %v", err)
+  }
+  if stat.Mode().Perm() != 0600 {
+    t.Errorf("expected file mode 0600, got %v", stat.Mode().Perm())
+  }
 
-	if !strings.Contains(creds.SSHCommand, creds.KeyPath) {
-		t.Errorf("expected SSHCommand %q to contain key path %q", creds.SSHCommand, creds.KeyPath)
-	}
+  data, err := os.ReadFile(creds.KeyPath)
+  if err != nil {
+    t.Fatalf("failed to read key file: %v", err)
+  }
+  if !strings.Contains(string(data), "fake-key-data") {
+    t.Errorf("key file content missing expected data: %s", string(data))
+  }
 
-	// Cleanup check
-	creds.Cleanup()
-	if _, err := os.Stat(creds.KeyPath); !os.IsNotExist(err) {
-		t.Errorf("expected key file to be removed after cleanup")
-	}
+  if !strings.Contains(creds.SSHCommand, creds.KeyPath) {
+    t.Errorf("expected SSHCommand %q to contain key path %q", creds.SSHCommand, creds.KeyPath)
+  }
+
+  // Cleanup check
+  creds.Cleanup()
+  if _, err := os.Stat(creds.KeyPath); !os.IsNotExist(err) {
+    t.Errorf("expected key file to be removed after cleanup")
+  }
+}
+
+// Helper to mirror Forgejo's encryption format so the test passes successfully
+func EncryptForgejoSecretForTest(secretKeyStr string, plaintext []byte) ([]byte, error) {
+  key := []byte(secretKeyStr)
+  if len(key) < 32 {
+    key = append(key, make([]byte, 32-len(key))...)
+  } else if len(key) > 32 {
+    key = key[:32]
+  }
+
+  block, err := aes.NewCipher(key)
+  if err != nil {
+    return nil, err
+  }
+
+  // Base64 encode first (matching Forgejo's internal pattern)
+  encoded := []byte(base64.StdEncoding.EncodeToString(plaintext))
+
+  // Generate IV
+  iv := make([]byte, aes.BlockSize)
+  if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+    return nil, err
+  }
+
+  ciphertext := make([]byte, len(encoded))
+  cfb := cipher.NewCFBEncrypter(block, iv)
+  cfb.XORKeyStream(ciphertext, encoded)
+
+  // Prepend IV to ciphertext
+  result := append(iv, ciphertext...)
+  return result, nil
 }
 
 func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {

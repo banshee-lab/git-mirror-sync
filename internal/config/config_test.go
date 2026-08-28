@@ -26,6 +26,7 @@ func validEnvMap() map[string]string {
 		"WEBHOOK_GITHUB_SECRET":     "gh_secret",
 		"WEBHOOK_GITLAB_SECRET":     "gl_secret",
 		"DASHBOARD_LISTEN_ADDR":     ":8081",
+		"FORGEJO_SECRET_KEY":				 "secret",
 	}
 }
 
@@ -145,8 +146,7 @@ func TestConfig_Load_MissingRequired_MultiError(t *testing.T) {
 		"FORGEJO_DB_NAME",
 		"FORGEJO_DB_SSLMODE",
 		"WEBHOOK_LISTEN_ADDR",
-		"WEBHOOK_GITHUB_SECRET",
-		"WEBHOOK_GITLAB_SECRET",
+		"FORGEJO_SECRET_KEY",
 		"DASHBOARD_LISTEN_ADDR",
 	}
 
