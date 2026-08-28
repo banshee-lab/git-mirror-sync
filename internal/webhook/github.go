@@ -67,7 +67,7 @@ type githubPayload struct {
 		FullName string `json:"full_name"`
 		Private  bool   `json:"private"`
 		HTMLURL  string `json:"html_url"`
-		SSHURL   string `json:"ssh_url"`
+		SSHURL   string `json:"git_url"`
 		CloneURL string `json:"clone_url"`
 		Owner    struct {
 			Name  string `json:"name"`
@@ -107,6 +107,9 @@ func (g *GitHubProvider) Parse(body []byte) (*RepoInfo, error) {
 		fullName = owner + "/" + repoName
 	}
 
+	// Convert "git:" to "ssh:" in the SSHURL field
+  sshURL := strings.Replace(payload.Repository.SSHURL, "git:", "ssh:", 1)
+
 	return &RepoInfo{
 		Provider: "github",
 		FullName: fullName,
@@ -114,7 +117,7 @@ func (g *GitHubProvider) Parse(body []byte) (*RepoInfo, error) {
 		Name:     repoName,
 		Private:  payload.Repository.Private,
 		HTMLURL:  payload.Repository.HTMLURL,
-		SSHURL:   payload.Repository.SSHURL,
+		SSHURL:   sshURL,
 		CloneURL: payload.Repository.CloneURL,
 		Ref:      payload.Ref,
 		Before:   payload.Before,

@@ -169,3 +169,6 @@ decision were specified and checked by a human; the implementation was
 generated rather than hand-typed, because at this point there's little
 value in typing out code by hand when the same result can be produced,
 reviewed, and iterated on in a fraction of the time.
+
+This is a personal project, and I don't plan to maintain it unless
+I found something that affects my workflow or I need a new feature.

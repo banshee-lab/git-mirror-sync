@@ -52,8 +52,7 @@ type gitlabPayload struct {
 		Namespace         string `json:"namespace"`
 		WebURL            string `json:"web_url"`
 		GitHTTPURL        string `json:"git_http_url"`
-		GitSSHURL         string `json:"git_ssh_url"`
-		Visibility        string `json:"visibility"`
+		Visibility        string `json:"visibility_level"`
 	} `json:"project"`
 }
 
@@ -84,7 +83,10 @@ func (g *GitLabProvider) Parse(body []byte) (*RepoInfo, error) {
 		fullName = owner + "/" + repoName
 	}
 
-	private := payload.Project.Visibility == "private" || payload.Project.Visibility == "internal"
+	private := payload.Project.Visibility == "0" || payload.Project.Visibility == "10"
+
+		// Convert "https:" to "ssh:" in the GitHTTPURL field
+  sshURL := strings.Replace(payload.Project.GitHTTPURL, "https:", "ssh:", 1)
 
 	return &RepoInfo{
 		Provider: "gitlab",
@@ -93,7 +95,7 @@ func (g *GitLabProvider) Parse(body []byte) (*RepoInfo, error) {
 		Name:     repoName,
 		Private:  private,
 		HTMLURL:  payload.Project.WebURL,
-		SSHURL:   payload.Project.GitSSHURL,
+		SSHURL:   sshURL,
 		CloneURL: payload.Project.GitHTTPURL,
 		Ref:      payload.Ref,
 		Before:   payload.Before,

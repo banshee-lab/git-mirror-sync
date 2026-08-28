@@ -70,6 +70,7 @@ const sampleGitHubPayload = `{
     "html_url": "https://github.com/octocat/hello-world",
     "clone_url": "https://github.com/octocat/hello-world.git",
     "ssh_url": "git@github.com:octocat/hello-world.git",
+		"git_url": "git://github.com/octocat/hello-world.git",
     "owner": {
       "name": "octocat",
       "login": "octocat"
@@ -86,9 +87,9 @@ const sampleGitLabPayload = `{
     "path_with_namespace": "mike/diaspora",
     "namespace": "mike",
     "web_url": "http://example.com/mike/diaspora",
-    "git_http_url": "http://example.com/mike/diaspora.git",
+    "git_http_url": "https://example.com/mike/diaspora.git",
     "git_ssh_url": "git@example.com:mike/diaspora.git",
-    "visibility": "private"
+    "visibility_level": "0"
   }
 }`
 
@@ -135,8 +136,8 @@ func TestGitHubWebhookSuccess(t *testing.T) {
 	if evt.CloneURL != "https://github.com/octocat/hello-world.git" {
 		t.Errorf("expected clone url https://github.com/octocat/hello-world.git, got %s", evt.CloneURL)
 	}
-	if evt.SSHURL != "git@github.com:octocat/hello-world.git" {
-		t.Errorf("expected ssh url git@github.com:octocat/hello-world.git, got %s", evt.SSHURL)
+	if evt.SSHURL != "ssh://github.com/octocat/hello-world.git" {
+		t.Errorf("expected ssh url ssh://github.com/octocat/hello-world.git, got %s", evt.SSHURL)
 	}
 	if evt.Ref != "refs/heads/main" {
 		t.Errorf("expected ref refs/heads/main, got %s", evt.Ref)
@@ -217,11 +218,11 @@ func TestGitLabWebhookSuccess(t *testing.T) {
 	if evt.RepoFullName != "mike/diaspora" {
 		t.Errorf("expected repo mike/diaspora, got %s", evt.RepoFullName)
 	}
-	if evt.CloneURL != "http://example.com/mike/diaspora.git" {
-		t.Errorf("expected clone url http://example.com/mike/diaspora.git, got %s", evt.CloneURL)
+	if evt.CloneURL != "https://example.com/mike/diaspora.git" {
+		t.Errorf("expected clone url https://example.com/mike/diaspora.git, got %s", evt.CloneURL)
 	}
-	if evt.SSHURL != "git@example.com:mike/diaspora.git" {
-		t.Errorf("expected ssh url git@example.com:mike/diaspora.git, got %s", evt.SSHURL)
+	if evt.SSHURL != "ssh://example.com/mike/diaspora.git" {
+		t.Errorf("expected ssh url ssh://example.com/mike/diaspora.git, got %s", evt.SSHURL)
 	}
 	if evt.Ref != "refs/heads/main" {
 		t.Errorf("expected ref refs/heads/main, got %s", evt.Ref)
