@@ -16,7 +16,7 @@ FROM alpine:latest
 
 RUN apk add --no-cache git openssh-client
 
-RUN addgroup -S git && git -S git -G git
+RUN addgroup -S git && adduser -S git -G git
 
 RUN mkdir -p /var/cache/forgejo-sync && chown -R git:git /var/cache/forgejo-sync
 
