@@ -13,8 +13,8 @@ import (
 
 	"forgejo-sync/internal/config"
 	"forgejo-sync/internal/dashboard"
-	"forgejo-sync/internal/forgejodb"
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/store"
 	"forgejo-sync/internal/webhook"
 	"forgejo-sync/internal/worker"
 )
@@ -39,8 +39,7 @@ func run() error {
 
 	logger.Info("starting forgejo-sync",
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("webhook_addr", cfg.WebhookListenAddr),
-		slog.String("dashboard_addr", cfg.DashboardListenAddr),
+		slog.String("listen_addr", cfg.ListenAddr),
 		slog.Int("worker_concurrency", cfg.WorkerConcurrency),
 		slog.Duration("git_timeout", cfg.GitCommandTimeout),
 	)
@@ -48,58 +47,71 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	historyStore, err := history.NewStore(cfg.HistoryDBPath)
+	// Initialize the app database (repositories, ssh_keys)
+	appDBPath := cfg.AppDBPath
+	appDB, err := store.NewDB(appDBPath)
+	if err != nil {
+		return fmt.Errorf("init app database: %w", err)
+	}
+	defer appDB.Close()
+
+	// Initialize the legacy history store (for worker/webhook/dashboard compatibility during migration)
+	historyDBPath := cfg.HistoryDBPath
+	if historyDBPath == "" {
+		historyDBPath = fmt.Sprintf("%s/history.db", cfg.CacheDir)
+	}
+
+	historyStore, err := history.NewStore(historyDBPath)
 	if err != nil {
 		return fmt.Errorf("init history store: %w", err)
 	}
 	defer historyStore.Close()
 
-	dbClient, err := forgejodb.NewClient(ctx, cfg)
-	if err != nil {
-		return fmt.Errorf("init forgejo db client: %w", err)
-	}
-	defer dbClient.Close()
+	// Extract store interfaces
+	repoStore := appDB.Repositories()
+	keyStore := appDB.SSHKeys()
 
-	workerPool := worker.New(cfg, dbClient, historyStore)
+	// Initialize the worker pool with the new store-based interfaces
+	workerPool := worker.New(cfg, repoStore, keyStore, historyStore)
 	workerPool.Start()
 
+	// Initialize the webhook server with per-repository secret verification
 	webhookOpts := webhook.ServerOptions{
-		History:      historyStore,
-		Enqueuer:     workerPool,
-		GitHubSecret: cfg.WebhookGitHubSecret,
-		GitLabSecret: cfg.WebhookGitLabSecret,
-		Logger:       logger,
+		History:         historyStore,
+		Enqueuer:        workerPool,
+		RepositoryStore: repoStore,
+		Logger:          logger,
 	}
 	webhookServerHandler := webhook.NewServer(webhookOpts)
 
-	webhookServer := &http.Server{
-		Addr:    cfg.WebhookListenAddr,
-		Handler: webhookServerHandler.Handler(),
-	}
+	// Create a single HTTP server for all routes
+	mux := http.NewServeMux()
+	
+	// Mount webhook handler
+	mux.HandleFunc("POST /webhook", webhookServerHandler.ServeHTTP)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 
+	// Mount legacy dashboard (will be replaced by REST API + Angular SPA in v2)
 	dashboardHandler, err := dashboard.NewRouter(historyStore)
 	if err != nil {
 		return fmt.Errorf("init dashboard router: %w", err)
 	}
+	mux.Handle("/", dashboardHandler)
 
-	dashboardServer := &http.Server{
-		Addr:    cfg.DashboardListenAddr,
-		Handler: dashboardHandler,
+	server := &http.Server{
+		Addr:    cfg.ListenAddr,
+		Handler: mux,
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1)
 
 	go func() {
-		logger.Info("webhook listener starting", slog.String("addr", cfg.WebhookListenAddr))
-		if err := webhookServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("webhook server error: %w", err)
-		}
-	}()
-
-	go func() {
-		logger.Info("dashboard server starting", slog.String("addr", cfg.DashboardListenAddr))
-		if err := dashboardServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("dashboard server error: %w", err)
+		logger.Info("server starting", slog.String("addr", cfg.ListenAddr))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("server error: %w", err)
 		}
 	}()
 
@@ -114,20 +126,12 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var shutdownErr error
-	if err := webhookServer.Shutdown(shutdownCtx); err != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("webhook server shutdown error: %w", err))
-	}
-	if err := dashboardServer.Shutdown(shutdownCtx); err != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("dashboard server shutdown error: %w", err))
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("server shutdown error: %w", err)
 	}
 
 	logger.Info("waiting for worker pool shutdown...")
 	workerPool.Shutdown()
-
-	if shutdownErr != nil {
-		return shutdownErr
-	}
 
 	logger.Info("shutdown complete")
 	return nil

@@ -13,7 +13,28 @@ import (
 
 // Config holds all configuration loaded from environment variables.
 type Config struct {
-	CacheDir               string
+	// v2 settings (new)
+	ListenAddr     string
+	CacheDir       string
+	AppDBPath      string // SQLite database for repositories, ssh_keys, and sync_events
+	SSHKeysDir     string
+	WorkerConcurrency int
+	GitCommandTimeout time.Duration
+	LogLevel       string
+	ParsedLogLevel slog.Level
+
+	// OIDC settings (v2)
+	OIDCIssuerURL    string
+	OIDCClientID     string
+	OIDCClientSecret string
+	OIDCRedirectURL  string
+	OIDCScopes       string
+	OIDCProviderName string
+	SessionSecret    string
+	SessionCookieName string
+	SessionTTL       time.Duration
+
+	// Legacy v1 settings (deprecated, to be removed)
 	ForgejoDataDir         string
 	ForgejoPushSSHKeyPath  string
 	ForgejoDomain          string
@@ -24,16 +45,12 @@ type Config struct {
 	ForgejoDBPassword      string
 	ForgejoDBName          string
 	ForgejoDBSSLMode       string
-	ForgejoSecret					 string
+	ForgejoSecret          string
 	WebhookListenAddr      string
 	WebhookGitHubSecret    string
 	WebhookGitLabSecret    string
 	HistoryDBPath          string
 	DashboardListenAddr    string
-	WorkerConcurrency      int
-	GitCommandTimeout      time.Duration
-	LogLevel               string
-	ParsedLogLevel         slog.Level
 }
 
 // Load reads and validates configuration from environment variables.
@@ -55,74 +72,63 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		return val
 	}
 
-	// Helper to get required int
-	getRequiredInt := func(key string) int {
+	// Helper to get optional string with default
+	getOptional := func(key, defaultVal string) string {
 		val := strings.TrimSpace(getenv(key))
 		if val == "" {
-			errs = append(errs, fmt.Errorf("%s is required", key))
-			return 0
+			return defaultVal
+		}
+		return val
+	}
+
+	// Helper to get optional int with default
+	getOptionalInt := func(key string, defaultVal int) int {
+		val := strings.TrimSpace(getenv(key))
+		if val == "" {
+			return defaultVal
 		}
 		n, err := strconv.Atoi(val)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s must be a valid integer: %w", key, err))
-			return 0
+			return defaultVal
 		}
 		return n
 	}
 
-	cfg.CacheDir = getRequired("CACHE_DIR")
-	cfg.ForgejoDataDir = getRequired("FORGEJO_DATA_DIR")
-	cfg.ForgejoPushSSHKeyPath = getRequired("FORGEJO_PUSH_SSH_KEY_PATH")
-	cfg.ForgejoDomain = getRequired("FORGEJO_DOMAIN")
-	cfg.ForgejoSSHPort = getRequiredInt("FORGEJO_SSH_PORT")
-
-	cfg.ForgejoDBHost = getRequired("FORGEJO_DB_HOST")
-	cfg.ForgejoDBPort = getRequiredInt("FORGEJO_DB_PORT")
-	cfg.ForgejoDBUser = getRequired("FORGEJO_DB_USER")
-	cfg.ForgejoDBPassword = getRequired("FORGEJO_DB_PASSWORD")
-	cfg.ForgejoDBName = getRequired("FORGEJO_DB_NAME")
-	cfg.ForgejoDBSSLMode = getRequired("FORGEJO_DB_SSLMODE")
-	cfg.ForgejoSecret = getRequired("FORGEJO_SECRET_KEY")
-	cfg.WebhookListenAddr = getRequired("WEBHOOK_LISTEN_ADDR")
-	cfg.WebhookGitHubSecret = strings.TrimSpace(getenv("WEBHOOK_GITHUB_SECRET"))
-	cfg.WebhookGitLabSecret = strings.TrimSpace(getenv("WEBHOOK_GITLAB_SECRET"))
-
-	// HISTORY_DB_PATH (optional, defaults to filepath.Join(CACHE_DIR, "history.db"))
-	historyDBPath := strings.TrimSpace(getenv("HISTORY_DB_PATH"))
-	if historyDBPath == "" {
-		if cfg.CacheDir != "" {
-			historyDBPath = filepath.Join(cfg.CacheDir, "history.db")
+	// Helper to parse duration
+	parseDuration := func(key string, defaultVal time.Duration) time.Duration {
+		val := strings.TrimSpace(getenv(key))
+		if val == "" {
+			return defaultVal
 		}
-	}
-	cfg.HistoryDBPath = historyDBPath
-
-	cfg.DashboardListenAddr = getRequired("DASHBOARD_LISTEN_ADDR")
-
-	// WORKER_CONCURRENCY (optional, default 4, int)
-	workerConcurrencyStr := strings.TrimSpace(getenv("WORKER_CONCURRENCY"))
-	if workerConcurrencyStr == "" {
-		cfg.WorkerConcurrency = 4
-	} else {
-		n, err := strconv.Atoi(workerConcurrencyStr)
-		if err != nil || n <= 0 {
-			errs = append(errs, fmt.Errorf("WORKER_CONCURRENCY must be a positive integer, got %q", workerConcurrencyStr))
-		} else {
-			cfg.WorkerConcurrency = n
-		}
-	}
-
-	// GIT_COMMAND_TIMEOUT (optional, default 10m, time.Duration parsed via time.ParseDuration)
-	gitTimeoutStr := strings.TrimSpace(getenv("GIT_COMMAND_TIMEOUT"))
-	if gitTimeoutStr == "" {
-		cfg.GitCommandTimeout = 10 * time.Minute
-	} else {
-		dur, err := time.ParseDuration(gitTimeoutStr)
+		dur, err := time.ParseDuration(val)
 		if err != nil || dur <= 0 {
-			errs = append(errs, fmt.Errorf("GIT_COMMAND_TIMEOUT must be a valid positive duration, got %q", gitTimeoutStr))
-		} else {
-			cfg.GitCommandTimeout = dur
+			errs = append(errs, fmt.Errorf("%s must be a valid positive duration, got %q", key, val))
+			return defaultVal
 		}
+		return dur
 	}
+
+	// v2 configuration (new)
+	cfg.ListenAddr = getRequired("LISTEN_ADDR")
+	cfg.CacheDir = getRequired("CACHE_DIR")
+	cfg.AppDBPath = getOptional("APP_DB_PATH", filepath.Join(cfg.CacheDir, "app.db"))
+	cfg.SSHKeysDir = getRequired("SSH_KEYS_DIR")
+
+	// v2 OIDC configuration
+	cfg.OIDCIssuerURL = getRequired("OIDC_ISSUER_URL")
+	cfg.OIDCClientID = getRequired("OIDC_CLIENT_ID")
+	cfg.OIDCClientSecret = getRequired("OIDC_CLIENT_SECRET")
+	cfg.OIDCRedirectURL = getRequired("OIDC_REDIRECT_URL")
+	cfg.OIDCScopes = getOptional("OIDC_SCOPES", "openid profile email")
+	cfg.OIDCProviderName = getOptional("OIDC_PROVIDER_NAME", "PocketID")
+	cfg.SessionSecret = getRequired("SESSION_SECRET")
+	cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
+	cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
+
+	// Worker and git settings
+	cfg.WorkerConcurrency = getOptionalInt("WORKER_CONCURRENCY", 4)
+	cfg.GitCommandTimeout = parseDuration("GIT_COMMAND_TIMEOUT", 10*time.Minute)
 
 	// LOG_LEVEL (optional, default info, validated one of debug/info/warn/error)
 	logLevelStr := strings.TrimSpace(getenv("LOG_LEVEL"))
@@ -145,6 +151,24 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 	default:
 		errs = append(errs, fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error; got %q", logLevelStr))
 	}
+
+	// Legacy v1 configuration (kept for backward compatibility during migration, will be removed)
+	cfg.ForgejoDataDir = getOptional("FORGEJO_DATA_DIR", "")
+	cfg.ForgejoPushSSHKeyPath = getOptional("FORGEJO_PUSH_SSH_KEY_PATH", "")
+	cfg.ForgejoDomain = getOptional("FORGEJO_DOMAIN", "")
+	cfg.ForgejoSSHPort = getOptionalInt("FORGEJO_SSH_PORT", 22)
+	cfg.ForgejoDBHost = getOptional("FORGEJO_DB_HOST", "")
+	cfg.ForgejoDBPort = getOptionalInt("FORGEJO_DB_PORT", 5432)
+	cfg.ForgejoDBUser = getOptional("FORGEJO_DB_USER", "")
+	cfg.ForgejoDBPassword = getOptional("FORGEJO_DB_PASSWORD", "")
+	cfg.ForgejoDBName = getOptional("FORGEJO_DB_NAME", "")
+	cfg.ForgejoDBSSLMode = getOptional("FORGEJO_DB_SSLMODE", "")
+	cfg.ForgejoSecret = getOptional("FORGEJO_SECRET_KEY", "")
+	cfg.WebhookListenAddr = getOptional("WEBHOOK_LISTEN_ADDR", "")
+	cfg.WebhookGitHubSecret = getOptional("WEBHOOK_GITHUB_SECRET", "")
+	cfg.WebhookGitLabSecret = getOptional("WEBHOOK_GITLAB_SECRET", "")
+	cfg.HistoryDBPath = getOptional("HISTORY_DB_PATH", "")
+	cfg.DashboardListenAddr = getOptional("DASHBOARD_LISTEN_ADDR", "")
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)

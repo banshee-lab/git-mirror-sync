@@ -8,21 +8,32 @@ import (
 	"time"
 
 	"forgejo-sync/internal/config"
-	"forgejo-sync/internal/forgejodb"
 	"forgejo-sync/internal/gitsync"
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/store"
 	"forgejo-sync/internal/webhook"
 )
 
-type fakeDB struct {
-	lookupFunc func(cloneURL string) (*forgejodb.MatchedRepo, error)
+type fakeRepoLookup struct {
+	lookupFunc func(normalizedPullURL string) ([]store.Repository, error)
 }
 
-func (f *fakeDB) LookupRepository(ctx context.Context, cloneURL, sshURL string) (*forgejodb.MatchedRepo, error) {
+func (f *fakeRepoLookup) ListByPullURL(ctx context.Context, normalizedPullURL string) ([]store.Repository, error) {
 	if f.lookupFunc != nil {
-		return f.lookupFunc(cloneURL)
+		return f.lookupFunc(normalizedPullURL)
 	}
-	return &forgejodb.MatchedRepo{RepoID: 1}, nil
+	return []store.Repository{{ID: 1, Enabled: true, PullURLSSH: normalizedPullURL, PushURLSSH: normalizedPullURL, PullSSHKeyID: 1, PushSSHKeyID: 2}}, nil
+}
+
+type fakeSSHKeyStore struct {
+	keys map[int64]store.SSHKey
+}
+
+func (f *fakeSSHKeyStore) Get(ctx context.Context, id int64) (store.SSHKey, error) {
+	if key, ok := f.keys[id]; ok {
+		return key, nil
+	}
+	return store.SSHKey{}, context.DeadlineExceeded
 }
 
 type fakeHistory struct {
@@ -54,7 +65,7 @@ func (f *fakeSyncer) SyncRepository(ctx context.Context, opts gitsync.SyncOption
 	return "/cache/path", nil
 }
 
-func (f *fakeSyncer) PushToForgejo(ctx context.Context, opts gitsync.PushOptions) (*gitsync.PushResult, error) {
+func (f *fakeSyncer) PushToRemote(ctx context.Context, opts gitsync.PushOptions) (*gitsync.PushResult, error) {
 	if f.pushFunc != nil {
 		return f.pushFunc()
 	}
@@ -62,13 +73,16 @@ func (f *fakeSyncer) PushToForgejo(ctx context.Context, opts gitsync.PushOptions
 }
 
 func TestPoolConcurrencySameRepo(t *testing.T) {
-	cfg := &config.Config{WorkerConcurrency: 2}
-	db := &fakeDB{}
-	store := newFakeHistory()
-	
+	cfg := &config.Config{WorkerConcurrency: 2, CacheDir: "/tmp", GitCommandTimeout: time.Minute}
+	repoLookup := &fakeRepoLookup{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) {
+		return []store.Repository{{ID: 1, Enabled: true, PullURLSSH: normalizedPullURL, PushURLSSH: normalizedPullURL, PullSSHKeyID: 1, PushSSHKeyID: 2}}, nil
+	}}
+	keyStore := &fakeSSHKeyStore{keys: map[int64]store.SSHKey{1: {PrivatePath: "/tmp/pull-key"}, 2: {PrivatePath: "/tmp/push-key"}}}
+	histStore := newFakeHistory()
+
 	var inFlight int32
 	var maxInFlight int32
-	
+
 	syncer := &fakeSyncer{
 		syncFunc: func() (string, error) {
 			current := atomic.AddInt32(&inFlight, 1)
@@ -80,44 +94,42 @@ func TestPoolConcurrencySameRepo(t *testing.T) {
 			return "/cache", nil
 		},
 	}
-	
-	pool := New(cfg, db, store)
+
+	pool := New(cfg, repoLookup, keyStore, histStore)
 	pool.gitSyncer = syncer
 	pool.Start()
-	
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "a"}, 1)
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "a"}, 2)
-	
-	// Wait a bit for jobs to process
+
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/org/repo.git"}, 1)
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/org/repo.git"}, 2)
+
 	time.Sleep(300 * time.Millisecond)
 	pool.Shutdown()
-	
+
 	if atomic.LoadInt32(&maxInFlight) > 1 {
 		t.Errorf("expected max 1 in-flight for same repo, got %d", maxInFlight)
 	}
-	
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.finishedRows[1] != history.StatusSuccess || store.finishedRows[2] != history.StatusSuccess {
-		t.Errorf("expected both jobs to succeed, got %v", store.finishedRows)
+
+	histStore.mu.Lock()
+	defer histStore.mu.Unlock()
+	if histStore.finishedRows[1] != history.StatusSuccess || histStore.finishedRows[2] != history.StatusSuccess {
+		t.Errorf("expected both jobs to succeed, got %v", histStore.finishedRows)
 	}
 }
 
 func TestPoolConcurrencyDifferentRepos(t *testing.T) {
-	cfg := &config.Config{WorkerConcurrency: 2}
-	db := &fakeDB{
-		lookupFunc: func(cloneURL string) (*forgejodb.MatchedRepo, error) {
-			if cloneURL == "a" {
-				return &forgejodb.MatchedRepo{RepoID: 1}, nil
-			}
-			return &forgejodb.MatchedRepo{RepoID: 2}, nil
-		},
-	}
-	store := newFakeHistory()
-	
+	cfg := &config.Config{WorkerConcurrency: 2, CacheDir: "/tmp", GitCommandTimeout: time.Minute}
+	repoLookup := &fakeRepoLookup{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) {
+		if normalizedPullURL == "ssh://git@example.com/org/a.git" {
+			return []store.Repository{{ID: 1, Enabled: true, PullURLSSH: normalizedPullURL, PushURLSSH: normalizedPullURL, PullSSHKeyID: 1, PushSSHKeyID: 2}}, nil
+		}
+		return []store.Repository{{ID: 2, Enabled: true, PullURLSSH: normalizedPullURL, PushURLSSH: normalizedPullURL, PullSSHKeyID: 1, PushSSHKeyID: 2}}, nil
+	}}
+	keyStore := &fakeSSHKeyStore{keys: map[int64]store.SSHKey{1: {PrivatePath: "/tmp/pull-key"}, 2: {PrivatePath: "/tmp/push-key"}}}
+	histStore := newFakeHistory()
+
 	var inFlight int32
 	var maxInFlight int32
-	
+
 	syncer := &fakeSyncer{
 		syncFunc: func() (string, error) {
 			current := atomic.AddInt32(&inFlight, 1)
@@ -132,61 +144,56 @@ func TestPoolConcurrencyDifferentRepos(t *testing.T) {
 			return "/cache", nil
 		},
 	}
-	
-	pool := New(cfg, db, store)
+
+	pool := New(cfg, repoLookup, keyStore, histStore)
 	pool.gitSyncer = syncer
 	pool.Start()
-	
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "a"}, 1)
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "b"}, 2)
-	
+
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/org/a.git"}, 1)
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/org/b.git"}, 2)
+
 	time.Sleep(300 * time.Millisecond)
 	pool.Shutdown()
-	
+
 	if atomic.LoadInt32(&maxInFlight) != 2 {
 		t.Errorf("expected max 2 in-flight for different repos, got %d", maxInFlight)
 	}
 }
 
 func TestPoolJobPaths(t *testing.T) {
-	cfg := &config.Config{WorkerConcurrency: 2}
-	store := newFakeHistory()
-	
-	db := &fakeDB{
-		lookupFunc: func(cloneURL string) (*forgejodb.MatchedRepo, error) {
-			if cloneURL == "skipped" {
-				return nil, forgejodb.ErrNoMatch
-			}
-			return &forgejodb.MatchedRepo{RepoID: 1}, nil
-		},
-	}
-	
+	cfg := &config.Config{WorkerConcurrency: 2, CacheDir: "/tmp", GitCommandTimeout: time.Minute}
+	histStore := newFakeHistory()
+
+	repoLookup := &fakeRepoLookup{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) {
+		if normalizedPullURL == "ssh://git@example.com/skip.git" {
+			return nil, nil
+		}
+		return []store.Repository{{ID: 1, Enabled: true, PullURLSSH: normalizedPullURL, PushURLSSH: normalizedPullURL, PullSSHKeyID: 1, PushSSHKeyID: 2}}, nil
+	}}
+	keyStore := &fakeSSHKeyStore{keys: map[int64]store.SSHKey{1: {PrivatePath: "/tmp/pull-key"}, 2: {PrivatePath: "/tmp/push-key"}}}
+
 	syncer := &fakeSyncer{
-		syncFunc: func() (string, error) {
-			return "/cache", nil
-		},
-		pushFunc: func() (*gitsync.PushResult, error) {
-			return nil, &gitsync.ErrConflict{Detail: "boom"}
-		},
+		syncFunc: func() (string, error) { return "/cache", nil },
+		pushFunc: func() (*gitsync.PushResult, error) { return nil, &gitsync.ErrConflict{Detail: "boom"} },
 	}
-	
-	pool := New(cfg, db, store)
+
+	pool := New(cfg, repoLookup, keyStore, histStore)
 	pool.gitSyncer = syncer
 	pool.Start()
-	
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "skipped"}, 1)
-	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "conflict"}, 2)
-	
+
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/skip.git"}, 1)
+	pool.Enqueue(context.Background(), webhook.RepoInfo{CloneURL: "https://example.com/conflict.git"}, 2)
+
 	time.Sleep(200 * time.Millisecond)
 	pool.Shutdown()
-	
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	
-	if store.finishedRows[1] != history.StatusSkipped {
-		t.Errorf("expected skipped, got %v", store.finishedRows[1])
+
+	histStore.mu.Lock()
+	defer histStore.mu.Unlock()
+
+	if histStore.finishedRows[1] != history.StatusSkipped {
+		t.Errorf("expected skipped, got %v", histStore.finishedRows[1])
 	}
-	if store.finishedRows[2] != history.StatusConflict {
-		t.Errorf("expected conflict, got %v", store.finishedRows[2])
+	if histStore.finishedRows[2] != history.StatusConflict {
+		t.Errorf("expected conflict, got %v", histStore.finishedRows[2])
 	}
 }

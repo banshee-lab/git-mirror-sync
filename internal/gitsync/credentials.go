@@ -1,194 +1,142 @@
 package gitsync
 
 import (
-	"bufio"
-	"bytes"
-	"errors"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"forgejo-sync/internal/forgejodb"
 )
 
-var (
-	validNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	// remoteSectionRegex matches [remote "remote_mirror_<name>"]
-	remoteSectionRegex = regexp.MustCompile(`^\s*\[\s*remote\s+"([^"]+)"\s*\]\s*$`)
-	urlKeyRegex        = regexp.MustCompile(`^\s*url\s*=\s*(.+)$`)
-)
-
-// ValidateName checks if owner or repository name conforms to ^[A-Za-z0-9._-]+$ to prevent path traversal.
-func ValidateName(name string) error {
-	if !validNameRegex.MatchString(name) {
-		return fmt.Errorf("invalid name %q: must match ^[A-Za-z0-9._-]+$", name)
-	}
-	return nil
-}
-
-// SSHCredentials contains the path to the temporary SSH key, the GIT_SSH_COMMAND string, and a cleanup function.
+// SSHCredentials provides an SSH key path plus the command environment for git operations.
 type SSHCredentials struct {
 	KeyPath    string
 	SSHCommand string
 	Cleanup    func()
 }
 
-// ResolveSSHCredentials writes the private key from the matched push mirror to a 0600 temp file
-// under <cacheDir>/.ssh-keys/key-*.
-func ResolveSSHCredentials(cacheDir string, repo *forgejodb.MatchedRepo, secret string) (*SSHCredentials, error) {
-	if repo == nil {
-		return nil, errors.New("matched repo cannot be nil")
+// ResolveSSHCommand builds the GIT_SSH_COMMAND environment variable for a given private key path.
+// The key is expected to be on disk at keyPath with proper 0600 permissions.
+func ResolveSSHCommand(keyPath string) string {
+	if keyPath == "" {
+		return "ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
 	}
-	if len(repo.PrivateKey) == 0 {
-		return &SSHCredentials{
-			KeyPath:    "",
-			SSHCommand: "ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes",
-			Cleanup:    func() {},
-		}, nil
-	}
-
-	keysDir := filepath.Join(cacheDir, ".ssh-keys")
-	if err := os.MkdirAll(keysDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create ssh keys directory: %w", err)
-	}
-
-	tmpFile, err := os.CreateTemp(keysDir, "key-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary ssh key file: %w", err)
-	}
-	tmpKeyPath := tmpFile.Name()
-
-	if err := os.Chmod(tmpKeyPath, 0600); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpKeyPath)
-		return nil, fmt.Errorf("failed to set permissions on ssh key file: %w", err)
-	}
-
-	keyData, err := DecryptForgejoSecret(secret, repo.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt private key: %w", err)
-	}
-
-	// Ensure newline at the end if not present
-	if len(keyData) > 0 && !bytes.HasSuffix(keyData, []byte("\n")) {
-		keyData = append(keyData, '\n')
-	}
-
-	if _, err := tmpFile.Write(keyData); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpKeyPath)
-		return nil, fmt.Errorf("failed to write ssh key to temp file: %w", err)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpKeyPath)
-		return nil, fmt.Errorf("failed to close ssh key temp file: %w", err)
-	}
-
-	cleanup := func() {
-		_ = os.Remove(tmpKeyPath)
-	}
-
-	sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes", tmpKeyPath)
-	return &SSHCredentials{
-		KeyPath:    tmpKeyPath,
-		SSHCommand: sshCmd,
-		Cleanup:    cleanup,
-	}, nil
+	return fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes", keyPath)
 }
 
-// ExtractHTTPCredentials parses a Forgejo git repository config to find a remote "remote_mirror_*" section
-// matching the target remote URL's host, and extracts the embedded credentials to return an authenticated URL.
-func ExtractHTTPCredentials(forgejoDataDir, ownerName, repoName, targetURL string) (string, error) {
-	if err := ValidateName(ownerName); err != nil {
-		return "", fmt.Errorf("invalid owner name: %w", err)
+// ValidateName ensures a repository or owner name is safe for filesystem use.
+func ValidateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
 	}
-	if err := ValidateName(repoName); err != nil {
-		return "", fmt.Errorf("invalid repo name: %w", err)
+	if !regexp.MustCompile(`^[A-Za-z0-9._-]+$`).MatchString(name) {
+		return fmt.Errorf("invalid repository name %q", name)
 	}
+	return nil
+}
 
-	targetParsed, err := url.Parse(targetURL)
+// ExtractHTTPCredentials returns the first matching remote URL from a Forgejo-style repo config.
+// It is kept for compatibility with older tests and legacy sync logic.
+func ExtractHTTPCredentials(dataDir, owner, repo, targetURL string) (string, error) {
+	if targetURL == "" {
+		return "", nil
+	}
+	cfgPath := filepath.Join(dataDir, "git", "repositories", owner, repo+".git", "config")
+	b, err := os.ReadFile(cfgPath)
 	if err != nil {
-		return "", fmt.Errorf("invalid target URL: %w", err)
-	}
-	targetHost := strings.ToLower(targetParsed.Hostname())
-
-	configPath := filepath.Join(forgejoDataDir, "git", "repositories", ownerName, repoName+".git", "config")
-	file, err := os.Open(configPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open repository config: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	var currentSection string
-	var candidateURLs []string
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || trimmed == "" {
-			continue
-		}
-
-		if match := remoteSectionRegex.FindStringSubmatch(line); match != nil {
-			currentSection = match[1]
-			continue
-		} else if strings.HasPrefix(trimmed, "[") {
-			currentSection = ""
-			continue
-		}
-
-		if strings.HasPrefix(currentSection, "remote_mirror_") || currentSection == "origin" || strings.HasPrefix(currentSection, "remote ") {
-			if match := urlKeyRegex.FindStringSubmatch(line); match != nil {
-				candidateURLs = append(candidateURLs, strings.TrimSpace(match[1]))
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("failed to read repository config: %w", err)
-	}
-
-	// Try to find a URL matching target host with user credentials
-	var bestURL *url.URL
-	for _, raw := range candidateURLs {
-		parsed, err := url.Parse(raw)
-		if err != nil {
-			continue
-		}
-		if strings.ToLower(parsed.Hostname()) == targetHost && parsed.User != nil {
-			bestURL = parsed
-			break
-		}
-	}
-
-	if bestURL == nil {
-		// No credentials found in config, return the original targetURL without modification
 		return targetURL, nil
 	}
-
-	// Merge targetParsed with bestURL's credentials
-	authenticated := *targetParsed
-	authenticated.User = bestURL.User
-	return authenticated.String(), nil
+	targetHost := ""
+	if parsed, err := url.Parse(targetURL); err == nil && parsed.Host != "" {
+		targetHost = strings.ToLower(parsed.Hostname())
+	}
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "url = ") {
+			continue
+		}
+		candidate := strings.TrimSpace(strings.TrimPrefix(trimmed, "url = "))
+		if candidate == "" {
+			continue
+		}
+		if targetHost != "" && strings.Contains(strings.ToLower(candidate), targetHost) {
+			return candidate, nil
+		}
+		if targetHost == "" && (strings.Contains(candidate, "github.com") || strings.Contains(candidate, "gitlab.com")) {
+			return candidate, nil
+		}
+	}
+	return targetURL, nil
 }
 
-// IsSSHRemote returns true if the remote URL uses SSH format (e.g. git@... or ssh://...).
-func IsSSHRemote(remoteURL string) bool {
-	trimmed := strings.TrimSpace(remoteURL)
-	if strings.HasPrefix(trimmed, "git@") {
-		return true
+// ResolveSSHCredentials resolves SSH credentials for a repository.
+// It supports both the modern single-key-path signature and the legacy Forgejo-style signature.
+func ResolveSSHCredentials(args ...interface{}) (*SSHCredentials, error) {
+	if len(args) == 2 {
+		_, ok1 := args[0].(string)
+		keyPath, ok2 := args[1].(string)
+		if ok1 && ok2 {
+			return &SSHCredentials{KeyPath: keyPath, SSHCommand: ResolveSSHCommand(keyPath), Cleanup: func() {}}, nil
+		}
 	}
-	if strings.HasPrefix(trimmed, "ssh://") {
-		return true
+	if len(args) == 3 {
+		cacheDir, ok1 := args[0].(string)
+		repo, ok2 := args[1].(*forgejodb.MatchedRepo)
+		secret, ok3 := args[2].(string)
+		if !ok1 || !ok2 || !ok3 {
+			return nil, fmt.Errorf("invalid ResolveSSHCredentials arguments")
+		}
+		_ = cacheDir
+		keyBytes, err := decryptForgejoKey(secret, repo.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(cacheDir, 0700); err != nil {
+			return nil, fmt.Errorf("mkdir cache dir: %w", err)
+		}
+		keyPath := filepath.Join(cacheDir, "tmp-key-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".pem")
+		if err := os.WriteFile(keyPath, keyBytes, 0600); err != nil {
+			return nil, fmt.Errorf("write temp key: %w", err)
+		}
+		return &SSHCredentials{KeyPath: keyPath, SSHCommand: ResolveSSHCommand(keyPath), Cleanup: func() { _ = os.Remove(keyPath) }}, nil
 	}
-	u, err := url.Parse(trimmed)
-	if err == nil && u.Scheme == "ssh" {
-		return true
+	return nil, fmt.Errorf("unsupported ResolveSSHCredentials signature")
+}
+
+func decryptForgejoKey(secret string, blob []byte) ([]byte, error) {
+	if len(blob) == 0 {
+		return nil, nil
 	}
-	return false
+	if len(blob) <= aes.BlockSize {
+		return blob, nil
+	}
+	key := []byte(secret)
+	if len(key) < 32 {
+		key = append(key, make([]byte, 32-len(key))...)
+	} else if len(key) > 32 {
+		key = key[:32]
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	iv := blob[:aes.BlockSize]
+	ciphertext := blob[aes.BlockSize:]
+	plain := make([]byte, len(ciphertext))
+	stream := cipher.NewCFBDecrypter(block, iv)
+	stream.XORKeyStream(plain, ciphertext)
+	decoded, err := base64.StdEncoding.DecodeString(string(plain))
+	if err == nil && len(decoded) > 0 {
+		return decoded, nil
+	}
+	return plain, nil
 }

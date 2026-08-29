@@ -27,15 +27,17 @@ type PushResult struct {
 	RawOutput string
 }
 
-// PushOptions holds options for pushing a repository mirror to Forgejo.
+// PushOptions holds options for pushing a repository mirror to a remote.
 type PushOptions struct {
 	CachePath             string
+	RemoteURL             string
+	RemoteKeyPath         string
+	Timeout               time.Duration
 	Owner                 string
 	Repo                  string
 	ForgejoDomain         string
 	ForgejoSSHPort        int
 	ForgejoPushSSHKeyPath string
-	Timeout               time.Duration
 }
 
 var (
@@ -54,20 +56,13 @@ var (
 	shaRangeRegex = regexp.MustCompile(`([0-9a-fA-F]{7,40})\.\.([0-9a-fA-F]{7,40})`)
 )
 
-// PushToForgejo pushes the bare mirror cache to Forgejo over SSH without force.
-func PushToForgejo(ctx context.Context, opts PushOptions) (*PushResult, error) {
-	if err := ValidateName(opts.Owner); err != nil {
-		return nil, fmt.Errorf("invalid owner name: %w", err)
+// PushToRemote pushes the bare mirror cache to a remote SSH URL without force.
+func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
+	if opts.CachePath == "" {
+		return nil, fmt.Errorf("cache path cannot be empty")
 	}
-	if err := ValidateName(opts.Repo); err != nil {
-		return nil, fmt.Errorf("invalid repo name: %w", err)
-	}
-	if opts.ForgejoDomain == "" {
-		return nil, fmt.Errorf("forgejo domain cannot be empty")
-	}
-	port := opts.ForgejoSSHPort
-	if port <= 0 {
-		port = 22
+	if opts.RemoteURL == "" {
+		return nil, fmt.Errorf("remote URL cannot be empty")
 	}
 
 	timeout := opts.Timeout
@@ -77,15 +72,11 @@ func PushToForgejo(ctx context.Context, opts PushOptions) (*PushResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	pushTarget := fmt.Sprintf("ssh://git@%s:%d/%s/%s.git", opts.ForgejoDomain, port, opts.Owner, opts.Repo)
+	sshCmd := ResolveSSHCommand(opts.RemoteKeyPath)
 
-	cmd := exec.CommandContext(ctx, "git", "-C", opts.CachePath, "push", pushTarget, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
+	cmd := exec.CommandContext(ctx, "git", "-C", opts.CachePath, "push", opts.RemoteURL, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-
-	if opts.ForgejoPushSSHKeyPath != "" {
-		sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes", opts.ForgejoPushSSHKeyPath)
-		cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND="+sshCmd)
-	}
+	cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND="+sshCmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -115,4 +106,9 @@ func PushToForgejo(ctx context.Context, opts PushOptions) (*PushResult, error) {
 	}
 
 	return result, nil
+}
+
+// PushToForgejo is kept for compatibility with the legacy worker contract.
+func PushToForgejo(ctx context.Context, opts PushOptions) (*PushResult, error) {
+	return PushToRemote(ctx, opts)
 }

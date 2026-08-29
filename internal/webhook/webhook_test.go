@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/store"
 	"forgejo-sync/internal/webhook"
 )
 
@@ -46,6 +47,23 @@ func (m *mockJobEnqueuer) Enqueue(ctx context.Context, repo webhook.RepoInfo, ev
 		EventID int64
 	}{Repo: repo, EventID: eventID})
 	return nil
+}
+
+type fakeRepoStore struct {
+	lookupFunc func(normalizedPullURL string) ([]store.Repository, error)
+}
+
+func (f *fakeRepoStore) Create(ctx context.Context, repo store.Repository) (store.Repository, error) { return repo, nil }
+func (f *fakeRepoStore) Update(ctx context.Context, repo store.Repository) (store.Repository, error) { return repo, nil }
+func (f *fakeRepoStore) Delete(ctx context.Context, id int64) error { return nil }
+func (f *fakeRepoStore) Get(ctx context.Context, id int64) (store.Repository, error) { return store.Repository{}, nil }
+func (f *fakeRepoStore) List(ctx context.Context) ([]store.Repository, error) { return nil, nil }
+func (f *fakeRepoStore) GetByName(ctx context.Context, name string) (store.Repository, error) { return store.Repository{}, nil }
+func (f *fakeRepoStore) ListByPullURL(ctx context.Context, normalizedPullURL string) ([]store.Repository, error) {
+	if f.lookupFunc != nil {
+		return f.lookupFunc(normalizedPullURL)
+	}
+	return nil, nil
 }
 
 func computeGitHubSig(secret string, body []byte) string {
@@ -96,12 +114,21 @@ const sampleGitLabPayload = `{
 func setupTestServer() (*webhook.Server, *mockHistoryWriter, *mockJobEnqueuer) {
 	hist := &mockHistoryWriter{}
 	enq := &mockJobEnqueuer{}
+	repoStore := &fakeRepoStore{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) {
+		switch normalizedPullURL {
+		case "ssh://git@github.com/octocat/hello-world.git":
+			return []store.Repository{{ID: 1, Name: "octocat/hello-world", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "github", WebhookSecHash: testGitHubSecret}}, nil
+		case "ssh://git@example.com/mike/diaspora.git":
+			return []store.Repository{{ID: 2, Name: "mike/diaspora", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "gitlab", WebhookSecHash: testGitLabSecret}}, nil
+		default:
+			return nil, nil
+		}
+	}}
 	srv := webhook.NewServer(webhook.ServerOptions{
-		History:      hist,
-		Enqueuer:     enq,
-		GitHubSecret: testGitHubSecret,
-		GitLabSecret: testGitLabSecret,
-		MaxBodyBytes: 1024 * 1024, // 1MB for test
+		History:          hist,
+		Enqueuer:         enq,
+		RepositoryStore:  repoStore,
+		MaxBodyBytes:     1024 * 1024, // 1MB for test
 	})
 	return srv, hist, enq
 }
@@ -277,10 +304,10 @@ func TestOversizedPayloadRejected(t *testing.T) {
 	hist := &mockHistoryWriter{}
 	enq := &mockJobEnqueuer{}
 	srv := webhook.NewServer(webhook.ServerOptions{
-		History:      hist,
-		Enqueuer:     enq,
-		GitHubSecret: testGitHubSecret,
-		MaxBodyBytes: 100, // Small limit for testing
+		History:         hist,
+		Enqueuer:        enq,
+		RepositoryStore: &fakeRepoStore{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) { return []store.Repository{{ID: 1, Name: "octocat/hello-world", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "github", WebhookSecHash: testGitHubSecret}}, nil }},
+		MaxBodyBytes:    100,
 	})
 
 	largeBody := bytes.Repeat([]byte("a"), 200)

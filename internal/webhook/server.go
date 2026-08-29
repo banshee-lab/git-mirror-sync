@@ -7,9 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
+	"forgejo-sync/internal/giturl"
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/store"
 )
 
 // HistoryWriter defines the interface for inserting sync events into the history store.
@@ -19,13 +24,12 @@ type HistoryWriter interface {
 
 // ServerOptions contains dependencies and configuration for Server.
 type ServerOptions struct {
-	Registry      *Registry
-	History       HistoryWriter
-	Enqueuer      JobEnqueuer
-	GitHubSecret  string
-	GitLabSecret  string
-	MaxBodyBytes  int64
-	Logger        *slog.Logger
+	Registry       *Registry
+	History        HistoryWriter
+	Enqueuer       JobEnqueuer
+	RepositoryStore store.RepositoryStore
+	MaxBodyBytes   int64
+	Logger         *slog.Logger
 }
 
 // Server handles incoming webhook HTTP requests.
@@ -33,7 +37,7 @@ type Server struct {
 	registry     *Registry
 	history      HistoryWriter
 	enqueuer     JobEnqueuer
-	secrets      map[string]string
+	repoStore    store.RepositoryStore
 	maxBodyBytes int64
 	logger       *slog.Logger
 	handler      http.Handler
@@ -59,16 +63,11 @@ func NewServer(opts ServerOptions) *Server {
 		reg = NewRegistry(NewGitHubProvider(), NewGitLabProvider())
 	}
 
-	secrets := map[string]string{
-		"github": opts.GitHubSecret,
-		"gitlab": opts.GitLabSecret,
-	}
-
 	s := &Server{
 		registry:     reg,
 		history:      opts.History,
 		enqueuer:     opts.Enqueuer,
-		secrets:      secrets,
+		repoStore:    opts.RepositoryStore,
 		maxBodyBytes: maxBytes,
 		logger:       logger,
 	}
@@ -89,11 +88,6 @@ func (s *Server) Handler() http.Handler {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
-}
-
-// SetSecret allows updating or setting a provider secret dynamically.
-func (s *Server) SetSecret(providerName, secret string) {
-	s.secrets[providerName] = secret
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -137,18 +131,8 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify signature/token
-	secret := s.secrets[provider.Name()]
-	if err := provider.VerifySignature(secret, r.Header, body); err != nil {
-		s.logger.Warn("webhook signature/token verification failed",
-			slog.String("provider", provider.Name()),
-			slog.Any("error", err),
-		)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Parse payload
+	// Parse payload first so we can match the repository and verify the request against
+	// the repository-specific secret instead of a global fallback secret map.
 	repoInfo, err := provider.Parse(body)
 	if err != nil {
 		s.logger.Warn("failed to parse webhook payload",
@@ -156,6 +140,58 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			slog.Any("error", err),
 		)
 		http.Error(w, fmt.Sprintf("Failed to parse payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	matchURL := repoInfo.CloneURL
+	if matchURL == "" {
+		matchURL = repoInfo.SSHURL
+	}
+	if matchURL != "" {
+		matchURL, err = giturl.NormalizeToSSH(matchURL, "git")
+		if err != nil {
+			s.logger.Warn("failed to normalize repository URL for lookup",
+				slog.String("provider", provider.Name()),
+				slog.String("repo", repoInfo.FullName),
+				slog.Any("error", err),
+			)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	matchedRepo := (*store.Repository)(nil)
+	if s.repoStore != nil {
+		repos, err := s.repoStore.ListByPullURL(r.Context(), matchURL)
+		if err != nil {
+			s.logger.Warn("failed to lookup matching repositories",
+				slog.String("provider", provider.Name()),
+				slog.String("repo", repoInfo.FullName),
+				slog.Any("error", err),
+			)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		for i := range repos {
+			repo := &repos[i]
+			if !repo.Enabled {
+				continue
+			}
+			if repo.ProviderHint != "" && repo.ProviderHint != provider.Name() {
+				continue
+			}
+			if err := verifyRepoSignature(provider, repo, r.Header, body); err == nil {
+				matchedRepo = repo
+				break
+			}
+		}
+	}
+	if matchedRepo == nil {
+		s.logger.Warn("webhook signature/token verification failed",
+			slog.String("provider", provider.Name()),
+			slog.String("repo", repoInfo.FullName),
+		)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -194,8 +230,6 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 				slog.Int64("event_id", eventID),
 				slog.Any("error", err),
 			)
-			// History was recorded, but enqueue failed. We still return 202 or 500?
-			// Webhook listener contract: if enqueue fails before return, return 500 so provider retries.
 			http.Error(w, "Failed to enqueue sync job", http.StatusInternalServerError)
 			return
 		}
@@ -205,8 +239,37 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		slog.String("provider", repoInfo.Provider),
 		slog.String("repo", repoInfo.FullName),
 		slog.Int64("event_id", eventID),
+		slog.String("matched_repo", matchedRepo.Name),
 	)
 
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("Accepted\n"))
 }
+
+func verifyRepoSignature(provider Provider, repo *store.Repository, h http.Header, body []byte) error {
+	if repo == nil || repo.WebhookSecHash == "" {
+		return errors.New("repository secret hash missing")
+	}
+
+	if err := provider.VerifySignature(repo.WebhookSecHash, h, body); err == nil {
+		return nil
+	}
+
+	if strings.HasPrefix(repo.WebhookSecHash, "$2") {
+		candidate := ""
+		switch provider.Name() {
+		case "gitlab":
+			candidate = h.Get("X-Gitlab-Token")
+		case "github":
+			candidate = h.Get("X-Hub-Signature-256")
+		}
+		if candidate != "" {
+			if err := bcrypt.CompareHashAndPassword([]byte(repo.WebhookSecHash), []byte(candidate)); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return errors.New("repository secret verification failed")
+}
+

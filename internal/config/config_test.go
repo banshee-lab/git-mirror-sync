@@ -11,7 +11,17 @@ import (
 
 func validEnvMap() map[string]string {
 	return map[string]string{
-		"CACHE_DIR":                 "/var/cache/forgejo-sync",
+		// v2 configuration
+		"LISTEN_ADDR":           ":8080",
+		"CACHE_DIR":             "/var/cache/forgejo-sync",
+		"APP_DB_PATH":           "/var/lib/forgejo-sync/app.db",
+		"SSH_KEYS_DIR":          "/var/lib/forgejo-sync/keys",
+		"OIDC_ISSUER_URL":       "https://id.example.com",
+		"OIDC_CLIENT_ID":        "forgejo-sync",
+		"OIDC_CLIENT_SECRET":    "client_secret",
+		"OIDC_REDIRECT_URL":     "https://sync.example.com/auth/callback",
+		"SESSION_SECRET":        "session_secret_32_bytes_minimum",
+		// Legacy v1 configuration (optional for backward compat)
 		"FORGEJO_DATA_DIR":          "/var/lib/forgejo/data",
 		"FORGEJO_PUSH_SSH_KEY_PATH": "/etc/forgejo/push_key",
 		"FORGEJO_DOMAIN":            "forgejo.example.com",
@@ -22,73 +32,58 @@ func validEnvMap() map[string]string {
 		"FORGEJO_DB_PASSWORD":       "secret_password",
 		"FORGEJO_DB_NAME":           "forgejo",
 		"FORGEJO_DB_SSLMODE":        "disable",
-		"WEBHOOK_LISTEN_ADDR":       ":8080",
+		"WEBHOOK_LISTEN_ADDR":       ":9090",
 		"WEBHOOK_GITHUB_SECRET":     "gh_secret",
 		"WEBHOOK_GITLAB_SECRET":     "gl_secret",
-		"DASHBOARD_LISTEN_ADDR":     ":8081",
-		"FORGEJO_SECRET_KEY":				 "secret",
+		"DASHBOARD_LISTEN_ADDR":     ":9091",
+		"FORGEJO_SECRET_KEY":        "secret",
 	}
 }
 
 func TestConfig_Load_Success(t *testing.T) {
 	env := validEnvMap()
-	env["HISTORY_DB_PATH"] = "/custom/path/history.db"
+	env["APP_DB_PATH"] = "/custom/path/app.db"
 	env["WORKER_CONCURRENCY"] = "8"
 	env["GIT_COMMAND_TIMEOUT"] = "5m"
 	env["LOG_LEVEL"] = "debug"
+	env["OIDC_SCOPES"] = "openid profile email"
+	env["SESSION_TTL"] = "48h"
 
 	cfg, err := config.LoadFrom(func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// v2 settings
+	if cfg.ListenAddr != ":8080" {
+		t.Errorf("expected ListenAddr :8080, got %q", cfg.ListenAddr)
+	}
 	if cfg.CacheDir != "/var/cache/forgejo-sync" {
 		t.Errorf("expected CacheDir to match, got %q", cfg.CacheDir)
 	}
-	if cfg.ForgejoDataDir != "/var/lib/forgejo/data" {
-		t.Errorf("expected ForgejoDataDir to match, got %q", cfg.ForgejoDataDir)
+	if cfg.AppDBPath != "/custom/path/app.db" {
+		t.Errorf("expected AppDBPath to match, got %q", cfg.AppDBPath)
 	}
-	if cfg.ForgejoPushSSHKeyPath != "/etc/forgejo/push_key" {
-		t.Errorf("expected ForgejoPushSSHKeyPath to match, got %q", cfg.ForgejoPushSSHKeyPath)
+	if cfg.SSHKeysDir != "/var/lib/forgejo-sync/keys" {
+		t.Errorf("expected SSHKeysDir to match, got %q", cfg.SSHKeysDir)
 	}
-	if cfg.ForgejoDomain != "forgejo.example.com" {
-		t.Errorf("expected ForgejoDomain to match, got %q", cfg.ForgejoDomain)
+	if cfg.OIDCIssuerURL != "https://id.example.com" {
+		t.Errorf("expected OIDCIssuerURL to match, got %q", cfg.OIDCIssuerURL)
 	}
-	if cfg.ForgejoSSHPort != 2222 {
-		t.Errorf("expected ForgejoSSHPort 2222, got %d", cfg.ForgejoSSHPort)
+	if cfg.OIDCClientID != "forgejo-sync" {
+		t.Errorf("expected OIDCClientID to match, got %q", cfg.OIDCClientID)
 	}
-	if cfg.ForgejoDBHost != "postgres.example.com" {
-		t.Errorf("expected ForgejoDBHost to match, got %q", cfg.ForgejoDBHost)
+	if cfg.OIDCRedirectURL != "https://sync.example.com/auth/callback" {
+		t.Errorf("expected OIDCRedirectURL to match, got %q", cfg.OIDCRedirectURL)
 	}
-	if cfg.ForgejoDBPort != 5432 {
-		t.Errorf("expected ForgejoDBPort 5432, got %d", cfg.ForgejoDBPort)
+	if cfg.SessionCookieName != "forgejo_sync_session" {
+		t.Errorf("expected SessionCookieName default, got %q", cfg.SessionCookieName)
 	}
-	if cfg.ForgejoDBUser != "forgejo_ro" {
-		t.Errorf("expected ForgejoDBUser to match, got %q", cfg.ForgejoDBUser)
+	if cfg.OIDCProviderName != "PocketID" {
+		t.Errorf("expected OIDCProviderName default, got %q", cfg.OIDCProviderName)
 	}
-	if cfg.ForgejoDBPassword != "secret_password" {
-		t.Errorf("expected ForgejoDBPassword to match, got %q", cfg.ForgejoDBPassword)
-	}
-	if cfg.ForgejoDBName != "forgejo" {
-		t.Errorf("expected ForgejoDBName to match, got %q", cfg.ForgejoDBName)
-	}
-	if cfg.ForgejoDBSSLMode != "disable" {
-		t.Errorf("expected ForgejoDBSSLMode to match, got %q", cfg.ForgejoDBSSLMode)
-	}
-	if cfg.WebhookListenAddr != ":8080" {
-		t.Errorf("expected WebhookListenAddr to match, got %q", cfg.WebhookListenAddr)
-	}
-	if cfg.WebhookGitHubSecret != "gh_secret" {
-		t.Errorf("expected WebhookGitHubSecret to match, got %q", cfg.WebhookGitHubSecret)
-	}
-	if cfg.WebhookGitLabSecret != "gl_secret" {
-		t.Errorf("expected WebhookGitLabSecret to match, got %q", cfg.WebhookGitLabSecret)
-	}
-	if cfg.DashboardListenAddr != ":8081" {
-		t.Errorf("expected DashboardListenAddr to match, got %q", cfg.DashboardListenAddr)
-	}
-	if cfg.HistoryDBPath != "/custom/path/history.db" {
-		t.Errorf("expected HistoryDBPath to match, got %q", cfg.HistoryDBPath)
+	if cfg.SessionTTL != 48*time.Hour {
+		t.Errorf("expected SessionTTL 48h, got %v", cfg.SessionTTL)
 	}
 	if cfg.WorkerConcurrency != 8 {
 		t.Errorf("expected WorkerConcurrency 8, got %d", cfg.WorkerConcurrency)
@@ -109,8 +104,17 @@ func TestConfig_Load_Defaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.HistoryDBPath != "/var/cache/forgejo-sync/history.db" {
-		t.Errorf("expected default HistoryDBPath %q, got %q", "/var/cache/forgejo-sync/history.db", cfg.HistoryDBPath)
+	if !strings.Contains(cfg.AppDBPath, "app.db") {
+		t.Errorf("expected AppDBPath to contain app.db, got %q", cfg.AppDBPath)
+	}
+	if cfg.SessionCookieName != "forgejo_sync_session" {
+		t.Errorf("expected default SessionCookieName, got %q", cfg.SessionCookieName)
+	}
+	if cfg.SessionTTL != 24*time.Hour {
+		t.Errorf("expected default SessionTTL 24h, got %v", cfg.SessionTTL)
+	}
+	if cfg.OIDCProviderName != "PocketID" {
+		t.Errorf("expected default OIDCProviderName, got %q", cfg.OIDCProviderName)
 	}
 	if cfg.WorkerConcurrency != 4 {
 		t.Errorf("expected default WorkerConcurrency 4, got %d", cfg.WorkerConcurrency)
@@ -134,20 +138,14 @@ func TestConfig_Load_MissingRequired_MultiError(t *testing.T) {
 	}
 
 	requiredVars := []string{
+		"LISTEN_ADDR",
 		"CACHE_DIR",
-		"FORGEJO_DATA_DIR",
-		"FORGEJO_PUSH_SSH_KEY_PATH",
-		"FORGEJO_DOMAIN",
-		"FORGEJO_SSH_PORT",
-		"FORGEJO_DB_HOST",
-		"FORGEJO_DB_PORT",
-		"FORGEJO_DB_USER",
-		"FORGEJO_DB_PASSWORD",
-		"FORGEJO_DB_NAME",
-		"FORGEJO_DB_SSLMODE",
-		"WEBHOOK_LISTEN_ADDR",
-		"FORGEJO_SECRET_KEY",
-		"DASHBOARD_LISTEN_ADDR",
+		"SSH_KEYS_DIR",
+		"OIDC_ISSUER_URL",
+		"OIDC_CLIENT_ID",
+		"OIDC_CLIENT_SECRET",
+		"OIDC_REDIRECT_URL",
+		"SESSION_SECRET",
 	}
 
 	errStr := err.Error()
@@ -160,11 +158,10 @@ func TestConfig_Load_MissingRequired_MultiError(t *testing.T) {
 
 func TestConfig_Load_InvalidValues(t *testing.T) {
 	env := validEnvMap()
-	env["FORGEJO_SSH_PORT"] = "not_an_int"
-	env["FORGEJO_DB_PORT"] = "also_not_an_int"
-	env["WORKER_CONCURRENCY"] = "-1"
+	env["WORKER_CONCURRENCY"] = "not_an_int"
 	env["GIT_COMMAND_TIMEOUT"] = "invalid_duration"
 	env["LOG_LEVEL"] = "super_trace"
+	env["SESSION_TTL"] = "invalid_duration"
 
 	_, err := config.LoadFrom(func(k string) string { return env[k] })
 	if err == nil {
@@ -173,11 +170,10 @@ func TestConfig_Load_InvalidValues(t *testing.T) {
 
 	errStr := err.Error()
 	expectedErrors := []string{
-		"FORGEJO_SSH_PORT",
-		"FORGEJO_DB_PORT",
 		"WORKER_CONCURRENCY",
 		"GIT_COMMAND_TIMEOUT",
 		"LOG_LEVEL",
+		"SESSION_TTL",
 	}
 
 	for _, field := range expectedErrors {
