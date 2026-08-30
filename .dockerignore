@@ -1,0 +1,43 @@
+.git
+.gitignore
+.dockerignore
+.github
+.vscode
+.idea
+.env
+.env.*
+.forgejo
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Node / frontend build outputs
+**/node_modules/
+**/.angular/
+**/.vite/
+**/dist/
+**/coverage/
+
+# Go build outputs
+bin/
+build/
+out/
+dist/
+coverage/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Embedded webapp build output
+internal/webapp/dist/
+
+# Local caches and editor files
+.cache/
+.tmp/
+tmp/
+**/__pycache__/
+**/.DS_Store

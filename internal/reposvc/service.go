@@ -21,6 +21,7 @@ import (
 type GitSyncer interface {
 	SyncRepository(ctx context.Context, opts gitsync.SyncOptions) (string, error)
 	PushToRemote(ctx context.Context, opts gitsync.PushOptions) (*gitsync.PushResult, error)
+	LsRemote(ctx context.Context, remoteURL string, keyPath string, timeout time.Duration) error
 }
 
 // EventRecorder stores sync history entries.
@@ -47,26 +48,41 @@ func NewService(repos store.RepositoryStore, keys store.SSHKeyStore, events Even
 	return &Service{repos: repos, keys: keys, events: events, git: git, keysDir: keysDir, cacheDir: cacheDir, logger: logger}
 }
 
+// ListRequest is the input parameters for listing repositories.
+type ListRequest struct {
+	Search   string `json:"search"`
+	Page     int    `json:"page"`
+	PageSize int    `json:"page_size"`
+}
+
+// ListResult represents paginated repository results.
+type ListResult struct {
+	Items    []store.Repository `json:"items"`
+	Total    int                `json:"total"`
+	Page     int                `json:"page"`
+	PageSize int                `json:"page_size"`
+}
+
 // CreateRequest is the input DTO for repository creation.
 type CreateRequest struct {
-	Name          string
-	PullURL       string
-	PullSSHKeyID  int64
-	PushURL       string
-	PushSSHKeyID  int64
-	WebhookSecret string
-	SyncNow       bool
+	Name          string `json:"name"`
+	PullURL       string `json:"pull_url"`
+	PullSSHKeyID  int64  `json:"pull_ssh_key_id"`
+	PushURL       string `json:"push_url"`
+	PushSSHKeyID  int64  `json:"push_ssh_key_id"`
+	WebhookSecret string `json:"webhook_secret"`
+	SyncNow       bool   `json:"sync_now"`
 }
 
 // UpdateRequest is the input DTO for repository updates.
 type UpdateRequest struct {
-	Name          string
-	PullURL       string
-	PullSSHKeyID  int64
-	PushURL       string
-	PushSSHKeyID  int64
-	WebhookSecret string
-	SyncNow       bool
+	Name          string `json:"name"`
+	PullURL       string `json:"pull_url"`
+	PullSSHKeyID  int64  `json:"pull_ssh_key_id"`
+	PushURL       string `json:"push_url"`
+	PushSSHKeyID  int64  `json:"push_ssh_key_id"`
+	WebhookSecret string `json:"webhook_secret"`
+	SyncNow       bool   `json:"sync_now"`
 }
 
 // Create creates a repository entry, normalizes both URLs, validates keys, and optionally syncs immediately.
@@ -111,16 +127,17 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (store.Reposito
 	}
 
 	repo := store.Repository{
-		Name:           req.Name,
-		PullURLRaw:     req.PullURL,
-		PullURLSSH:     pullSSH,
-		PullSSHKeyID:   req.PullSSHKeyID,
-		PushURLRaw:     req.PushURL,
-		PushURLSSH:     pushSSH,
-		PushSSHKeyID:   req.PushSSHKeyID,
-		WebhookSecHash: hashSecret(req.WebhookSecret),
-		ProviderHint:   inferProvider(req.PullURL),
-		Enabled:        true,
+		Name:             req.Name,
+		PullURLRaw:       req.PullURL,
+		PullURLSSH:       pullSSH,
+		PullSSHKeyID:     req.PullSSHKeyID,
+		PushURLRaw:       req.PushURL,
+		PushURLSSH:       pushSSH,
+		PushSSHKeyID:     req.PushSSHKeyID,
+		WebhookSecHash:   hashSecret(req.WebhookSecret),
+		ProviderHint:     inferProvider(req.PullURL),
+		PushProviderHint: inferProvider(req.PushURL),
+		Enabled:          true,
 	}
 
 	created, err := s.repos.Create(ctx, repo)
@@ -142,9 +159,27 @@ func (s *Service) Get(ctx context.Context, id int64) (store.Repository, error) {
 	return s.repos.Get(ctx, id)
 }
 
-// List lists repositories.
-func (s *Service) List(ctx context.Context) ([]store.Repository, error) {
-	return s.repos.List(ctx)
+// List lists repositories with pagination and optional search filter.
+func (s *Service) List(ctx context.Context, req ListRequest) (ListResult, error) {
+	if req.Page < 1 {
+		req.Page = 1
+	}
+	if req.PageSize < 1 {
+		req.PageSize = 20
+	} else if req.PageSize > 100 {
+		req.PageSize = 100
+	}
+	offset := (req.Page - 1) * req.PageSize
+	items, total, err := s.repos.ListPage(ctx, req.Search, req.PageSize, offset)
+	if err != nil {
+		return ListResult{}, err
+	}
+	return ListResult{
+		Items:    items,
+		Total:    total,
+		Page:     req.Page,
+		PageSize: req.PageSize,
+	}, nil
 }
 
 // Delete removes a repository by ID.
@@ -211,6 +246,7 @@ func (s *Service) Update(ctx context.Context, id int64, req UpdateRequest) (stor
 		existing.WebhookSecHash = hashSecret(req.WebhookSecret)
 	}
 	existing.ProviderHint = inferProvider(req.PullURL)
+	existing.PushProviderHint = inferProvider(req.PushURL)
 
 	updated, err := s.repos.Update(ctx, existing)
 	if err != nil {
@@ -276,7 +312,7 @@ func (s *Service) SyncNow(ctx context.Context, repoID int64) (int64, error) {
 		RepoFullName: repo.Name,
 		CloneURL:     repo.PullURLRaw,
 		SSHURL:       repo.PullURLSSH,
-		Ref:          "main",
+		Ref:          "refs/heads/*",
 		CommitBefore: "",
 		CommitAfter:  "",
 		Status:       "success",
@@ -292,11 +328,18 @@ func (s *Service) SyncNow(ctx context.Context, repoID int64) (int64, error) {
 }
 
 func inferProvider(rawURL string) string {
-	if strings.Contains(strings.ToLower(rawURL), "gitlab") {
+	lower := strings.ToLower(rawURL)
+	if strings.Contains(lower, "gitlab") {
 		return "gitlab"
 	}
-	if strings.Contains(strings.ToLower(rawURL), "github") {
+	if strings.Contains(lower, "github") {
 		return "github"
+	}
+	if strings.Contains(lower, "forgejo") {
+		return "forgejo"
+	}
+	if strings.Contains(lower, "gitea") {
+		return "gitea"
 	}
 	return "generic"
 }
@@ -304,4 +347,76 @@ func inferProvider(rawURL string) string {
 func hashSecret(secret string) string {
 	sum := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestConnectionRequest is the input for testing repository connections.
+type TestConnectionRequest struct {
+	PullURL      string `json:"pull_url"`
+	PullSSHKeyID int64  `json:"pull_ssh_key_id"`
+	PushURL      string `json:"push_url"`
+	PushSSHKeyID int64  `json:"push_ssh_key_id"`
+}
+
+// DirectionTestResult holds the reachability outcome for one remote direction.
+type DirectionTestResult struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+// TestConnectionResult holds the reachability results for pull and push remotes.
+type TestConnectionResult struct {
+	Pull DirectionTestResult `json:"pull"`
+	Push DirectionTestResult `json:"push"`
+}
+
+// TestConnection verifies reachability for pull and push remotes.
+func (s *Service) TestConnection(ctx context.Context, req TestConnectionRequest) (TestConnectionResult, error) {
+	result := TestConnectionResult{
+		Pull: DirectionTestResult{OK: true, Message: "Connection successful"},
+		Push: DirectionTestResult{OK: true, Message: "Connection successful"},
+	}
+
+	if req.PullURL == "" {
+		result.Pull = DirectionTestResult{OK: false, Message: "Pull URL is required"}
+	} else {
+		pullSSH, err := giturl.NormalizeToSSH(req.PullURL, "git")
+		if err != nil {
+			result.Pull = DirectionTestResult{OK: false, Message: fmt.Sprintf("Invalid pull URL: %v", err)}
+		} else if req.PullSSHKeyID == 0 {
+			result.Pull = DirectionTestResult{OK: false, Message: "Pull SSH key is required"}
+		} else {
+			key, err := s.keys.Get(ctx, req.PullSSHKeyID)
+			if err != nil {
+				result.Pull = DirectionTestResult{OK: false, Message: fmt.Sprintf("Pull SSH key not found: %v", err)}
+			} else {
+				keyPath := filepath.Join(s.keysDir, key.PrivatePath)
+				if err := s.git.LsRemote(ctx, pullSSH, keyPath, 15*time.Second); err != nil {
+					result.Pull = DirectionTestResult{OK: false, Message: err.Error()}
+				}
+			}
+		}
+	}
+
+	if req.PushURL == "" {
+		result.Push = DirectionTestResult{OK: false, Message: "Push URL is required"}
+	} else {
+		pushSSH, err := giturl.NormalizeToSSH(req.PushURL, "git")
+		if err != nil {
+			result.Push = DirectionTestResult{OK: false, Message: fmt.Sprintf("Invalid push URL: %v", err)}
+		} else if req.PushSSHKeyID == 0 {
+			result.Push = DirectionTestResult{OK: false, Message: "Push SSH key is required"}
+		} else {
+			key, err := s.keys.Get(ctx, req.PushSSHKeyID)
+			if err != nil {
+				result.Push = DirectionTestResult{OK: false, Message: fmt.Sprintf("Push SSH key not found: %v", err)}
+			} else {
+				keyPath := filepath.Join(s.keysDir, key.PrivatePath)
+				if err := s.git.LsRemote(ctx, pushSSH, keyPath, 15*time.Second); err != nil {
+					result.Push = DirectionTestResult{OK: false, Message: err.Error()}
+				}
+			}
+		}
+	}
+
+	return result, nil
 }

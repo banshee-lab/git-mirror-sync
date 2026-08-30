@@ -58,6 +58,7 @@ func (f *fakeRepoStore) Update(ctx context.Context, repo store.Repository) (stor
 func (f *fakeRepoStore) Delete(ctx context.Context, id int64) error { return nil }
 func (f *fakeRepoStore) Get(ctx context.Context, id int64) (store.Repository, error) { return store.Repository{}, nil }
 func (f *fakeRepoStore) List(ctx context.Context) ([]store.Repository, error) { return nil, nil }
+func (f *fakeRepoStore) ListPage(ctx context.Context, search string, limit, offset int) ([]store.Repository, int, error) { return nil, 0, nil }
 func (f *fakeRepoStore) GetByName(ctx context.Context, name string) (store.Repository, error) { return store.Repository{}, nil }
 func (f *fakeRepoStore) ListByPullURL(ctx context.Context, normalizedPullURL string) ([]store.Repository, error) {
 	if f.lookupFunc != nil {

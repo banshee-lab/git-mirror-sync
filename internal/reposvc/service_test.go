@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"forgejo-sync/internal/gitsync"
 	"forgejo-sync/internal/store"
@@ -58,6 +59,24 @@ func (f *fakeRepoStore) List(ctx context.Context) ([]store.Repository, error) {
 		out = append(out, repo)
 	}
 	return out, nil
+}
+
+func (f *fakeRepoStore) ListPage(ctx context.Context, search string, limit, offset int) ([]store.Repository, int, error) {
+	var filtered []store.Repository
+	for _, repo := range f.repos {
+		if search == "" || repo.Name == search {
+			filtered = append(filtered, repo)
+		}
+	}
+	total := len(filtered)
+	if offset >= len(filtered) {
+		return []store.Repository{}, total, nil
+	}
+	end := len(filtered)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return filtered[offset:end], total, nil
 }
 
 func (f *fakeRepoStore) GetByName(ctx context.Context, name string) (store.Repository, error) {
@@ -155,6 +174,10 @@ func (f *fakeGit) PushToRemote(ctx context.Context, opts gitsync.PushOptions) (*
 	f.pushCalled = true
 	f.lastPush = opts
 	return &gitsync.PushResult{RawOutput: "ok"}, nil
+}
+
+func (f *fakeGit) LsRemote(ctx context.Context, remoteURL string, keyPath string, timeout time.Duration) error {
+	return nil
 }
 
 func TestServiceCreateNormalizesURLsAndValidatesKeys(t *testing.T) {
@@ -329,5 +352,59 @@ func TestServiceCreateRejectsDuplicateName(t *testing.T) {
 	_, err = service.Create(ctx, CreateRequest{Name: "repo", PullURL: "git@github.com:owner/other", PullSSHKeyID: pullKey.ID, PushURL: "git@github.com:owner/dest2", PushSSHKeyID: pushKey.ID, WebhookSecret: "second"})
 	if err == nil {
 		t.Fatal("expected duplicate name error")
+	}
+}
+
+func TestServiceListPagination(t *testing.T) {
+	ctx := context.Background()
+	repoStore := newFakeRepoStore()
+	keyStore := newFakeKeyStore()
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+
+	for i := 1; i <= 5; i++ {
+		_, _ = repoStore.Create(ctx, store.Repository{
+			Name: fmt.Sprintf("repo-%d", i),
+		})
+	}
+
+	result, err := service.List(ctx, ListRequest{Page: 1, PageSize: 2})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if result.Total != 5 {
+		t.Errorf("expected total 5, got %d", result.Total)
+	}
+	if len(result.Items) != 2 {
+		t.Errorf("expected 2 items, got %d", len(result.Items))
+	}
+	if result.Page != 1 || result.PageSize != 2 {
+		t.Errorf("expected page 1 size 2, got page %d size %d", result.Page, result.PageSize)
+	}
+}
+
+func TestServicePushProviderHint(t *testing.T) {
+	ctx := context.Background()
+	repoStore := newFakeRepoStore()
+	keyStore := newFakeKeyStore()
+	key1, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull-key", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
+	key2, _ := keyStore.Create(ctx, store.SSHKey{Name: "push-key", PrivatePath: "push.pem", PublicPath: "push.pub"})
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+
+	repo, err := service.Create(ctx, CreateRequest{
+		Name:          "provider-test",
+		PullURL:       "git@github.com:owner/repo.git",
+		PullSSHKeyID:  key1.ID,
+		PushURL:       "ssh://git@forgejo.example.com:2222/owner/repo.git",
+		PushSSHKeyID:  key2.ID,
+		WebhookSecret: "secret",
+	})
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	if repo.ProviderHint != "github" {
+		t.Errorf("expected github provider hint, got %s", repo.ProviderHint)
+	}
+	if repo.PushProviderHint != "forgejo" {
+		t.Errorf("expected forgejo push provider hint, got %s", repo.PushProviderHint)
 	}
 }

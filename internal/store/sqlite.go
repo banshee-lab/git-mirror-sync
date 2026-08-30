@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"forgejo-sync/internal/history"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS repositories (
     push_ssh_key_id     INTEGER NOT NULL REFERENCES ssh_keys(id),
     webhook_secret_hash TEXT NOT NULL,
     provider_hint       TEXT,
+    push_provider_hint  TEXT,
     enabled             INTEGER NOT NULL DEFAULT 1,
     created_at          TIMESTAMP NOT NULL,
     updated_at          TIMESTAMP NOT NULL
@@ -72,10 +75,10 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
 	}
 
-	// Enable foreign keys
-	if _, err := sqldb.Exec("PRAGMA foreign_keys = ON"); err != nil {
+	// Enable foreign keys, WAL mode, and busy timeout
+	if _, err := sqldb.Exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"); err != nil {
 		sqldb.Close()
-		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
+		return nil, fmt.Errorf("failed to configure SQLite pragmas: %w", err)
 	}
 
 	db := &DB{conn: sqldb}
@@ -94,8 +97,11 @@ func (db *DB) initSchema() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	_, err := db.conn.Exec(schema)
-	return err
+	if _, err := db.conn.Exec(schema); err != nil {
+		return err
+	}
+	_, _ = db.conn.Exec("ALTER TABLE repositories ADD COLUMN push_provider_hint TEXT")
+	return nil
 }
 
 // Close closes the database connection.
@@ -124,6 +130,45 @@ type repositoryStoreImpl struct {
 	db *DB
 }
 
+func scanRepositoryRow(scanner interface{ Scan(dest ...any) error }) (Repository, error) {
+	var repo Repository
+	var providerHint, pushProviderHint sql.NullString
+	var lastSyncAt sql.NullTime
+	var lastSyncStatus sql.NullString
+	err := scanner.Scan(
+		&repo.ID, &repo.Name, &repo.PullURLRaw, &repo.PullURLSSH, &repo.PullSSHKeyID,
+		&repo.PushURLRaw, &repo.PushURLSSH, &repo.PushSSHKeyID, &repo.WebhookSecHash,
+		&providerHint, &pushProviderHint, &repo.Enabled, &repo.CreatedAt, &repo.UpdatedAt,
+		&lastSyncAt, &lastSyncStatus,
+	)
+	if err != nil {
+		return Repository{}, err
+	}
+	if providerHint.Valid {
+		repo.ProviderHint = providerHint.String
+	}
+	if pushProviderHint.Valid {
+		repo.PushProviderHint = pushProviderHint.String
+	}
+	if lastSyncAt.Valid {
+		repo.LastSyncAt = &lastSyncAt.Time
+	}
+	if lastSyncStatus.Valid {
+		repo.LastSyncStatus = lastSyncStatus.String
+	}
+	return repo, nil
+}
+
+const repoSelectFields = `
+	r.id, r.name, r.pull_url_raw, r.pull_url_ssh, r.pull_ssh_key_id,
+	r.push_url_raw, r.push_url_ssh, r.push_ssh_key_id, r.webhook_secret_hash,
+	r.provider_hint, r.push_provider_hint, r.enabled, r.created_at, r.updated_at,
+	se.received_at, se.status
+FROM repositories r
+LEFT JOIN sync_events se ON se.id = (
+	SELECT id FROM sync_events WHERE repo_full_name = r.name ORDER BY received_at DESC LIMIT 1
+)`
+
 func (r *repositoryStoreImpl) Create(ctx context.Context, repo Repository) (Repository, error) {
 	now := time.Now()
 	repo.CreatedAt = now
@@ -133,11 +178,11 @@ func (r *repositoryStoreImpl) Create(ctx context.Context, repo Repository) (Repo
 		ctx,
 		`INSERT INTO repositories (name, pull_url_raw, pull_url_ssh, pull_ssh_key_id,
 			push_url_raw, push_url_ssh, push_ssh_key_id, webhook_secret_hash,
-			provider_hint, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			provider_hint, push_provider_hint, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		repo.Name, repo.PullURLRaw, repo.PullURLSSH, repo.PullSSHKeyID,
 		repo.PushURLRaw, repo.PushURLSSH, repo.PushSSHKeyID, repo.WebhookSecHash,
-		repo.ProviderHint, repo.Enabled, repo.CreatedAt, repo.UpdatedAt,
+		repo.ProviderHint, repo.PushProviderHint, repo.Enabled, repo.CreatedAt, repo.UpdatedAt,
 	)
 	if err != nil {
 		return Repository{}, fmt.Errorf("failed to create repository: %w", err)
@@ -160,11 +205,11 @@ func (r *repositoryStoreImpl) Update(ctx context.Context, repo Repository) (Repo
 		`UPDATE repositories
 		SET name = ?, pull_url_raw = ?, pull_url_ssh = ?, pull_ssh_key_id = ?,
 			push_url_raw = ?, push_url_ssh = ?, push_ssh_key_id = ?, webhook_secret_hash = ?,
-			provider_hint = ?, enabled = ?, updated_at = ?
+			provider_hint = ?, push_provider_hint = ?, enabled = ?, updated_at = ?
 		WHERE id = ?`,
 		repo.Name, repo.PullURLRaw, repo.PullURLSSH, repo.PullSSHKeyID,
 		repo.PushURLRaw, repo.PushURLSSH, repo.PushSSHKeyID, repo.WebhookSecHash,
-		repo.ProviderHint, repo.Enabled, repo.UpdatedAt, repo.ID,
+		repo.ProviderHint, repo.PushProviderHint, repo.Enabled, repo.UpdatedAt, repo.ID,
 	)
 	if err != nil {
 		return Repository{}, fmt.Errorf("failed to update repository: %w", err)
@@ -182,19 +227,12 @@ func (r *repositoryStoreImpl) Delete(ctx context.Context, id int64) error {
 }
 
 func (r *repositoryStoreImpl) Get(ctx context.Context, id int64) (Repository, error) {
-	var repo Repository
-	err := r.db.conn.QueryRowContext(
+	row := r.db.conn.QueryRowContext(
 		ctx,
-		`SELECT id, name, pull_url_raw, pull_url_ssh, pull_ssh_key_id,
-			push_url_raw, push_url_ssh, push_ssh_key_id, webhook_secret_hash,
-			provider_hint, enabled, created_at, updated_at
-		FROM repositories WHERE id = ?`,
+		`SELECT `+repoSelectFields+` WHERE r.id = ?`,
 		id,
-	).Scan(
-		&repo.ID, &repo.Name, &repo.PullURLRaw, &repo.PullURLSSH, &repo.PullSSHKeyID,
-		&repo.PushURLRaw, &repo.PushURLSSH, &repo.PushSSHKeyID, &repo.WebhookSecHash,
-		&repo.ProviderHint, &repo.Enabled, &repo.CreatedAt, &repo.UpdatedAt,
 	)
+	repo, err := scanRepositoryRow(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return Repository{}, fmt.Errorf("repository not found")
@@ -205,52 +243,70 @@ func (r *repositoryStoreImpl) Get(ctx context.Context, id int64) (Repository, er
 }
 
 func (r *repositoryStoreImpl) List(ctx context.Context) ([]Repository, error) {
-	rows, err := r.db.conn.QueryContext(
-		ctx,
-		`SELECT id, name, pull_url_raw, pull_url_ssh, pull_ssh_key_id,
-			push_url_raw, push_url_ssh, push_ssh_key_id, webhook_secret_hash,
-			provider_hint, enabled, created_at, updated_at
-		FROM repositories ORDER BY created_at DESC`,
-	)
+	items, _, err := r.ListPage(ctx, "", 0, 0)
+	return items, err
+}
+
+func (r *repositoryStoreImpl) ListPage(ctx context.Context, search string, limit, offset int) ([]Repository, int, error) {
+	var total int
+	if search != "" {
+		pattern := "%" + search + "%"
+		err := r.db.conn.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM repositories WHERE name LIKE ? COLLATE NOCASE OR pull_url_ssh LIKE ? COLLATE NOCASE OR push_url_ssh LIKE ? COLLATE NOCASE`,
+			pattern, pattern, pattern,
+		).Scan(&total)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to count repositories: %w", err)
+		}
+	} else {
+		err := r.db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM repositories`).Scan(&total)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to count repositories: %w", err)
+		}
+	}
+
+	query := `SELECT ` + repoSelectFields
+	var args []any
+	if search != "" {
+		pattern := "%" + search + "%"
+		query += ` WHERE r.name LIKE ? COLLATE NOCASE OR r.pull_url_ssh LIKE ? COLLATE NOCASE OR r.push_url_ssh LIKE ? COLLATE NOCASE`
+		args = append(args, pattern, pattern, pattern)
+	}
+	query += ` ORDER BY r.created_at DESC`
+	if limit > 0 {
+		query += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := r.db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list repositories: %w", err)
+		return nil, 0, fmt.Errorf("failed to list repositories: %w", err)
 	}
 	defer rows.Close()
 
-	var repos []Repository
+	repos := make([]Repository, 0)
 	for rows.Next() {
-		var repo Repository
-		if err := rows.Scan(
-			&repo.ID, &repo.Name, &repo.PullURLRaw, &repo.PullURLSSH, &repo.PullSSHKeyID,
-			&repo.PushURLRaw, &repo.PushURLSSH, &repo.PushSSHKeyID, &repo.WebhookSecHash,
-			&repo.ProviderHint, &repo.Enabled, &repo.CreatedAt, &repo.UpdatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan repository: %w", err)
+		repo, err := scanRepositoryRow(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to scan repository: %w", err)
 		}
 		repos = append(repos, repo)
 	}
 
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error reading repositories: %w", err)
+		return nil, 0, fmt.Errorf("error reading repositories: %w", err)
 	}
 
-	return repos, nil
+	return repos, total, nil
 }
 
 func (r *repositoryStoreImpl) GetByName(ctx context.Context, name string) (Repository, error) {
-	var repo Repository
-	err := r.db.conn.QueryRowContext(
+	row := r.db.conn.QueryRowContext(
 		ctx,
-		`SELECT id, name, pull_url_raw, pull_url_ssh, pull_ssh_key_id,
-			push_url_raw, push_url_ssh, push_ssh_key_id, webhook_secret_hash,
-			provider_hint, enabled, created_at, updated_at
-		FROM repositories WHERE name = ?`,
+		`SELECT `+repoSelectFields+` WHERE r.name = ?`,
 		name,
-	).Scan(
-		&repo.ID, &repo.Name, &repo.PullURLRaw, &repo.PullURLSSH, &repo.PullSSHKeyID,
-		&repo.PushURLRaw, &repo.PushURLSSH, &repo.PushSSHKeyID, &repo.WebhookSecHash,
-		&repo.ProviderHint, &repo.Enabled, &repo.CreatedAt, &repo.UpdatedAt,
 	)
+	repo, err := scanRepositoryRow(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return Repository{}, fmt.Errorf("repository not found")
@@ -263,10 +319,7 @@ func (r *repositoryStoreImpl) GetByName(ctx context.Context, name string) (Repos
 func (r *repositoryStoreImpl) ListByPullURL(ctx context.Context, normalizedPullURL string) ([]Repository, error) {
 	rows, err := r.db.conn.QueryContext(
 		ctx,
-		`SELECT id, name, pull_url_raw, pull_url_ssh, pull_ssh_key_id,
-			push_url_raw, push_url_ssh, push_ssh_key_id, webhook_secret_hash,
-			provider_hint, enabled, created_at, updated_at
-		FROM repositories WHERE pull_url_ssh = ?`,
+		`SELECT `+repoSelectFields+` WHERE r.pull_url_ssh = ?`,
 		normalizedPullURL,
 	)
 	if err != nil {
@@ -274,14 +327,10 @@ func (r *repositoryStoreImpl) ListByPullURL(ctx context.Context, normalizedPullU
 	}
 	defer rows.Close()
 
-	var repos []Repository
+	repos := make([]Repository, 0)
 	for rows.Next() {
-		var repo Repository
-		if err := rows.Scan(
-			&repo.ID, &repo.Name, &repo.PullURLRaw, &repo.PullURLSSH, &repo.PullSSHKeyID,
-			&repo.PushURLRaw, &repo.PushURLSSH, &repo.PushSSHKeyID, &repo.WebhookSecHash,
-			&repo.ProviderHint, &repo.Enabled, &repo.CreatedAt, &repo.UpdatedAt,
-		); err != nil {
+		repo, err := scanRepositoryRow(rows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan repository: %w", err)
 		}
 		repos = append(repos, repo)
@@ -356,7 +405,7 @@ func (s *sshKeyStoreImpl) List(ctx context.Context) ([]SSHKey, error) {
 	}
 	defer rows.Close()
 
-	var keys []SSHKey
+	keys := make([]SSHKey, 0)
 	for rows.Next() {
 		var key SSHKey
 		if err := rows.Scan(&key.ID, &key.Name, &key.KeyType, &key.PrivatePath, &key.PublicPath, &key.Fingerprint, &key.CreatedAt); err != nil {
@@ -432,6 +481,77 @@ func (s *syncEventStoreImpl) Create(ctx context.Context, event SyncEvent) (SyncE
 	return event, nil
 }
 
+func (s *syncEventStoreImpl) Insert(ctx context.Context, event history.SyncEvent) (int64, error) {
+	if !event.Status.IsValid() {
+		return 0, fmt.Errorf("invalid status: %q", event.Status)
+	}
+
+	insertEvent := SyncEvent{
+		ReceivedAt:   event.ReceivedAt,
+		Provider:     event.Provider,
+		RepoFullName: event.RepoFullName,
+		CloneURL:     event.CloneURL,
+		SSHURL:       event.SSHURL,
+		ForgejoOwner: event.ForgejoOwner,
+		ForgejoRepo:  event.ForgejoRepo,
+		Ref:          event.Ref,
+		CommitBefore: event.CommitBefore,
+		CommitAfter:  event.CommitAfter,
+		Status:       string(event.Status),
+		Detail:       event.Detail,
+	}
+	if event.FinishedAt != nil {
+		insertEvent.FinishedAt = *event.FinishedAt
+	}
+	if event.DurationMS != nil {
+		insertEvent.DurationMS = *event.DurationMS
+	}
+	created, err := s.Create(ctx, insertEvent)
+	if err != nil {
+		return 0, err
+	}
+	return created.ID, nil
+}
+
+func (s *syncEventStoreImpl) Finish(ctx context.Context, id int64, status history.Status, detail string, commitAfter string, finishedAt time.Time) error {
+	if !status.IsValid() {
+		return fmt.Errorf("invalid status: %q", status)
+	}
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
+	}
+
+	var receivedAt time.Time
+	var prevCommitAfter sql.NullString
+	if err := s.db.conn.QueryRowContext(ctx, `SELECT received_at, commit_after FROM sync_events WHERE id = ?`, id).Scan(&receivedAt, &prevCommitAfter); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("sync event with id %d not found", id)
+		}
+		return fmt.Errorf("query sync event %d: %w", id, err)
+	}
+
+	finalCommitAfter := commitAfter
+	if finalCommitAfter == "" && prevCommitAfter.Valid {
+		finalCommitAfter = prevCommitAfter.String
+	}
+	durationMS := finishedAt.Sub(receivedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+
+	_, err := s.db.conn.ExecContext(ctx, `UPDATE sync_events SET finished_at = ?, status = ?, detail = ?, commit_after = ?, duration_ms = ? WHERE id = ?`,
+		finishedAt.UTC(), status, detail, finalCommitAfter, durationMS, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update sync_event %d: %w", id, err)
+	}
+	return nil
+}
+
+func (s *syncEventStoreImpl) Prune(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return s.PruneOlderThan(ctx, time.Now().UTC().Add(-olderThan))
+}
+
 func (s *syncEventStoreImpl) List(ctx context.Context, limit int) ([]SyncEvent, error) {
 	rows, err := s.db.conn.QueryContext(
 		ctx,
@@ -446,7 +566,7 @@ func (s *syncEventStoreImpl) List(ctx context.Context, limit int) ([]SyncEvent, 
 	}
 	defer rows.Close()
 
-	var events []SyncEvent
+	events := make([]SyncEvent, 0)
 	for rows.Next() {
 		var event SyncEvent
 		if err := rows.Scan(

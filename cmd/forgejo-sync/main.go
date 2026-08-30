@@ -8,16 +8,35 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"forgejo-sync/internal/api"
+	"forgejo-sync/internal/auth"
 	"forgejo-sync/internal/config"
-	"forgejo-sync/internal/dashboard"
-	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/gitsync"
+	"forgejo-sync/internal/reposvc"
+	"forgejo-sync/internal/sshkeys"
 	"forgejo-sync/internal/store"
+	"forgejo-sync/internal/webapp"
 	"forgejo-sync/internal/webhook"
 	"forgejo-sync/internal/worker"
 )
+
+type gitSyncer struct{}
+
+func (gitSyncer) SyncRepository(ctx context.Context, opts gitsync.SyncOptions) (string, error) {
+	return gitsync.SyncRepository(ctx, opts)
+}
+
+func (gitSyncer) PushToRemote(ctx context.Context, opts gitsync.PushOptions) (*gitsync.PushResult, error) {
+	return gitsync.PushToRemote(ctx, opts)
+}
+
+func (gitSyncer) LsRemote(ctx context.Context, remoteURL string, keyPath string, timeout time.Duration) error {
+	return gitsync.LsRemote(ctx, remoteURL, keyPath, timeout)
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -44,6 +63,10 @@ func run() error {
 		slog.Duration("git_timeout", cfg.GitCommandTimeout),
 	)
 
+	if cfg.Mode == "development" && cfg.SessionSecret == "development-session-secret-change-me" {
+		logger.Warn("running in development mode with default insecure SESSION_SECRET; do not use in production")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -55,51 +78,72 @@ func run() error {
 	}
 	defer appDB.Close()
 
-	// Initialize the legacy history store (for worker/webhook/dashboard compatibility during migration)
-	historyDBPath := cfg.HistoryDBPath
-	if historyDBPath == "" {
-		historyDBPath = fmt.Sprintf("%s/history.db", cfg.CacheDir)
-	}
-
-	historyStore, err := history.NewStore(historyDBPath)
-	if err != nil {
-		return fmt.Errorf("init history store: %w", err)
-	}
-	defer historyStore.Close()
-
 	// Extract store interfaces
 	repoStore := appDB.Repositories()
 	keyStore := appDB.SSHKeys()
+	if err := os.MkdirAll(cfg.SSHKeysDir, 0o700); err != nil {
+		return fmt.Errorf("init ssh keys directory: %w", err)
+	}
 
-	// Initialize the worker pool with the new store-based interfaces
-	workerPool := worker.New(cfg, repoStore, keyStore, historyStore)
+	keyManager := sshkeys.NewManager(cfg.SSHKeysDir, keyStore, repoStore, logger)
+	repoSvc := reposvc.NewService(repoStore, keyStore, appDB.SyncEvents(), gitSyncer{}, cfg.SSHKeysDir, cfg.CacheDir, logger)
+
+	authProvider, err := auth.NewProvider(auth.Config{
+		Mode:          cfg.Mode,
+		IssuerURL:     cfg.OIDCIssuerURL,
+		ClientID:      cfg.OIDCClientID,
+		ClientSecret:  cfg.OIDCClientSecret,
+		RedirectURL:   cfg.OIDCRedirectURL,
+		Scopes:        strings.Fields(cfg.OIDCScopes),
+		ProviderName:  cfg.OIDCProviderName,
+		SessionSecret: cfg.SessionSecret,
+		SessionCookie: cfg.SessionCookieName,
+		SessionTTL:    cfg.SessionTTL,
+		Logger:        logger,
+	})
+	if err != nil {
+		return fmt.Errorf("init auth provider: %w", err)
+	}
+
+	// Initialize the worker pool and webhook server against the same app DB.
+	eventStore := appDB.SyncEvents()
+	workerPool := worker.New(cfg, repoStore, keyStore, eventStore)
 	workerPool.Start()
 
-	// Initialize the webhook server with per-repository secret verification
 	webhookOpts := webhook.ServerOptions{
-		History:         historyStore,
+		History:         eventStore,
 		Enqueuer:        workerPool,
 		RepositoryStore: repoStore,
 		Logger:          logger,
 	}
 	webhookServerHandler := webhook.NewServer(webhookOpts)
 
+	apiHandler := api.NewHandler(api.Options{
+		RepoStore:  repoStore,
+		KeyStore:   keyStore,
+		EventStore: appDB.SyncEvents(),
+		RepoSvc:    repoSvc,
+		KeyMgr:     keyManager,
+		Auth:       authProvider,
+		Logger:     logger,
+	})
+
 	// Create a single HTTP server for all routes
 	mux := http.NewServeMux()
-	
-	// Mount webhook handler
+	mux.Handle("/auth/", authProvider.Handler())
+	mux.Handle("/api/", auth.RequireAuth(authProvider, apiHandler))
 	mux.HandleFunc("POST /webhook", webhookServerHandler.ServeHTTP)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Mount legacy dashboard (will be replaced by REST API + Angular SPA in v2)
-	dashboardHandler, err := dashboard.NewRouter(historyStore)
+	// Serve the Angular SPA for browser navigation and client-side routes.
+	spaHandler, err := webapp.NewHandler()
 	if err != nil {
-		return fmt.Errorf("init dashboard router: %w", err)
+		return fmt.Errorf("init spa router: %w", err)
 	}
-	mux.Handle("/", dashboardHandler)
+	mux.Handle("/", spaHandler)
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,

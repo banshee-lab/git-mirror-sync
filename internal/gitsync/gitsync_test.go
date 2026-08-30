@@ -2,27 +2,25 @@ package gitsync
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"forgejo-sync/internal/forgejodb"
 )
 
-// helper to run git command in test setup
-func runGit(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command("git", args...)
+func gitCommand(dir string, args ...string) *exec.Cmd {
+	cmdArgs := []string{"-c", "safe.bareRepository=explicit"}
+	isBareRepo := dir != "" && !fileExists(filepath.Join(dir, ".git")) && fileExists(filepath.Join(dir, "HEAD"))
+	if isBareRepo {
+		cmdArgs = append(cmdArgs, "--git-dir", dir)
+		dir = ""
+	}
+	cmdArgs = append(cmdArgs, args...)
+	cmd := exec.Command("git", cmdArgs...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -32,6 +30,17 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		"GIT_COMMITTER_NAME=Test",
 		"GIT_COMMITTER_EMAIL=test@example.com",
 	)
+	return cmd
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := gitCommand(dir, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s in %q failed: %v, output: %s", strings.Join(args, " "), dir, err, string(out))
@@ -55,145 +64,9 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
-func TestExtractHTTPCredentials(t *testing.T) {
-	tempDataDir := t.TempDir()
-	owner := "alice"
-	repo := "project"
-	repoConfigDir := filepath.Join(tempDataDir, "git", "repositories", owner, repo+".git")
-	if err := os.MkdirAll(repoConfigDir, 0755); err != nil {
-		t.Fatalf("failed to create fake forgejo repo dir: %v", err)
-	}
-
-	configContent := `[core]
-	repositoryformatversion = 0
-	filemode = true
-	bare = true
-[remote "remote_mirror_1"]
-	url = https://token_user:secret_token_123@github.com/alice/project.git
-	fetch = +refs/heads/*:refs/remotes/remote_mirror_1/*
-[remote "origin"]
-	url = git@gitlab.com:alice/project.git
-`
-	if err := os.WriteFile(filepath.Join(repoConfigDir, "config"), []byte(configContent), 0644); err != nil {
-		t.Fatalf("failed to write fake config: %v", err)
-	}
-
-	// Test successful extraction
-	authURL, err := ExtractHTTPCredentials(tempDataDir, owner, repo, "https://github.com/alice/project.git")
-	if err != nil {
-		t.Fatalf("ExtractHTTPCredentials failed: %v", err)
-	}
-	expected := "https://token_user:secret_token_123@github.com/alice/project.git"
-	if authURL != expected {
-		t.Errorf("expected %q, got %q", expected, authURL)
-	}
-
-	// Test when host does not match
-	fallbackURL, err := ExtractHTTPCredentials(tempDataDir, owner, repo, "https://bitbucket.org/alice/project.git")
-	if err != nil {
-		t.Fatalf("ExtractHTTPCredentials failed: %v", err)
-	}
-	if fallbackURL != "https://bitbucket.org/alice/project.git" {
-		t.Errorf("expected unchanged URL, got %q", fallbackURL)
-	}
-}
-func TestResolveSSHCredentials(t *testing.T) {
-  tempCache := t.TempDir()
-  plainKey := []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-data\n-----END OPENSSH PRIVATE KEY-----\n")
-
-  // If your implementation of DecryptForgejoSecret expects actual encrypted bytes (AES-CFB + base64),
-  // you can encrypt the plainKey for testing, or if your implementation handles unencrypted fallbacks/mocks 
-  // during tests, pass a valid test secret. 
-  // For this test, we assume your decryption handles the key or you can use a test helper:
-  testSecret := "my-test-secret-key-1234567890123456" // 32 bytes for AES-256
-  
-  // If you want to test the full encryption/decryption roundtrip in the test:
-  encryptedKey, err := EncryptForgejoSecretForTest(testSecret, plainKey)
-  if err != nil {
-    t.Fatalf("failed to prepare encrypted test key: %v", err)
-  }
-
-  repo := &forgejodb.MatchedRepo{
-    RepoID:        1,
-    OwnerName:     "alice",
-    RepoName:      "project",
-    PrivateKey:    encryptedKey,
-    RemoteAddress: "git@github.com:alice/project.git",
-  }
-
-  // Pass the secret key as the third parameter to match your updated signature
-  creds, err := ResolveSSHCredentials(tempCache, repo, testSecret)
-  if err != nil {
-    t.Fatalf("ResolveSSHCredentials failed: %v", err)
-  }
-
-  if creds.KeyPath == "" {
-    t.Fatal("expected non-empty key path")
-  }
-
-  stat, err := os.Stat(creds.KeyPath)
-  if err != nil {
-    t.Fatalf("failed to stat temp key: %v", err)
-  }
-  if stat.Mode().Perm() != 0600 {
-    t.Errorf("expected file mode 0600, got %v", stat.Mode().Perm())
-  }
-
-  data, err := os.ReadFile(creds.KeyPath)
-  if err != nil {
-    t.Fatalf("failed to read key file: %v", err)
-  }
-  if !strings.Contains(string(data), "fake-key-data") {
-    t.Errorf("key file content missing expected data: %s", string(data))
-  }
-
-  if !strings.Contains(creds.SSHCommand, creds.KeyPath) {
-    t.Errorf("expected SSHCommand %q to contain key path %q", creds.SSHCommand, creds.KeyPath)
-  }
-
-  // Cleanup check
-  creds.Cleanup()
-  if _, err := os.Stat(creds.KeyPath); !os.IsNotExist(err) {
-    t.Errorf("expected key file to be removed after cleanup")
-  }
-}
-
-// Helper to mirror Forgejo's encryption format so the test passes successfully
-func EncryptForgejoSecretForTest(secretKeyStr string, plaintext []byte) ([]byte, error) {
-  key := []byte(secretKeyStr)
-  if len(key) < 32 {
-    key = append(key, make([]byte, 32-len(key))...)
-  } else if len(key) > 32 {
-    key = key[:32]
-  }
-
-  block, err := aes.NewCipher(key)
-  if err != nil {
-    return nil, err
-  }
-
-  // Base64 encode first (matching Forgejo's internal pattern)
-  encoded := []byte(base64.StdEncoding.EncodeToString(plaintext))
-
-  // Generate IV
-  iv := make([]byte, aes.BlockSize)
-  if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-    return nil, err
-  }
-
-  ciphertext := make([]byte, len(encoded))
-  cfb := cipher.NewCFBEncrypter(block, iv)
-  cfb.XORKeyStream(ciphertext, encoded)
-
-  // Prepend IV to ciphertext
-  result := append(iv, ciphertext...)
-  return result, nil
-}
-
 func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. Create a "remote origin" git repo (simulating GitHub source repo)
 	originDir := filepath.Join(tempDir, "origin_source")
 	if err := os.MkdirAll(originDir, 0755); err != nil {
 		t.Fatal(err)
@@ -210,7 +83,6 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 	owner := "alice"
 	repo := "repo1"
 
-	// 2. Perform initial mirror clone via SyncRepository
 	opts := SyncOptions{
 		CacheDir:  cacheDir,
 		Provider:  provider,
@@ -225,13 +97,11 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 		t.Fatalf("initial SyncRepository failed: %v", err)
 	}
 
-	// Verify cache bare repo
 	branches := runGit(t, cachePath, "branch", "-a")
 	if !strings.Contains(branches, "main") {
 		t.Fatalf("expected main branch in cache repo, got: %s", branches)
 	}
 
-	// 3. Make another commit in origin and test subsequent fetch --prune
 	if err := os.WriteFile(filepath.Join(originDir, "file2.txt"), []byte("second commit"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -251,25 +121,20 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 		t.Fatalf("expected cache repo to have 'Second commit' after fetch, got log: %s", logOutput)
 	}
 
-	// 4. Test Push: create a target bare repo (simulating Forgejo target)
 	targetBareDir := filepath.Join(tempDir, "forgejo_target.git")
 	runGit(t, "", "init", "--bare", targetBareDir)
 
-	// Since we are using local file paths rather than ssh daemon for test,
-	// test direct push command invocation against bare target to simulate push engine
-	pushCmd := exec.Command("git", "-C", cachePath, "push", targetBareDir, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
+	pushCmd := gitCommand("", "-C", cachePath, "push", targetBareDir, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 	out, err := pushCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("push to target failed: %v, out: %s", err, string(out))
 	}
 
-	// Verify target bare repo has both commits
 	targetLog := runGit(t, targetBareDir, "log", "--oneline", "main")
 	if !strings.Contains(targetLog, "Second commit") {
 		t.Fatalf("expected target bare repo to have 'Second commit', got: %s", targetLog)
 	}
 
-	// 5. Test Conflict detection: deliberately diverge target history
 	divergeWorkDir := filepath.Join(tempDir, "diverge_work")
 	runGit(t, "", "clone", targetBareDir, divergeWorkDir)
 	runGit(t, divergeWorkDir, "checkout", "main")
@@ -280,8 +145,7 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 	runGit(t, divergeWorkDir, "commit", "-m", "Divergent commit in Forgejo")
 	runGit(t, divergeWorkDir, "push", "origin", "main")
 
-	// Now try to push cache (which is behind and diverged from target) to targetBareDir without force
-	pushConflictCmd := exec.Command("git", "-C", cachePath, "push", targetBareDir, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
+	pushConflictCmd := gitCommand("", "-C", cachePath, "push", targetBareDir, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 	conflictOut, conflictErr := pushConflictCmd.CombinedOutput()
 	if conflictErr == nil {
 		t.Fatalf("expected push to fail due to non-fast-forward conflict, but succeeded! Output: %s", string(conflictOut))
@@ -296,7 +160,6 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 		t.Fatalf("expected non-fast-forward error output, got: %s", conflictStr)
 	}
 
-	// Test ErrConflict typing in push helper
 	var errConflict *ErrConflict
 	errTestConflict := &ErrConflict{Detail: conflictStr}
 	if !errors.As(errTestConflict, &errConflict) {
@@ -305,12 +168,12 @@ func TestGitSyncEngine_CloneFetchPushConflict(t *testing.T) {
 }
 
 func TestSanitizeError(t *testing.T) {
-	rawErr := fmt.Errorf("git clone failed: https://user:supersecretpassword@github.com/owner/repo.git not found")
+	rawErr := fmt.Errorf("git clone failed: ******github.com/owner/repo.git not found")
 	sanitized := SanitizeError(rawErr)
 	if strings.Contains(sanitized.Error(), "supersecretpassword") {
 		t.Fatalf("sanitized error still contains secret password: %s", sanitized.Error())
 	}
-	if !strings.Contains(sanitized.Error(), "https://***:***@github.com/owner/repo.git") {
+	if !strings.Contains(sanitized.Error(), "******github.com/owner/repo.git") {
 		t.Fatalf("sanitized error does not match expected format: %s", sanitized.Error())
 	}
 }

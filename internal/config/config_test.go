@@ -12,31 +12,15 @@ import (
 func validEnvMap() map[string]string {
 	return map[string]string{
 		// v2 configuration
-		"LISTEN_ADDR":           ":8080",
-		"CACHE_DIR":             "/var/cache/forgejo-sync",
-		"APP_DB_PATH":           "/var/lib/forgejo-sync/app.db",
-		"SSH_KEYS_DIR":          "/var/lib/forgejo-sync/keys",
-		"OIDC_ISSUER_URL":       "https://id.example.com",
-		"OIDC_CLIENT_ID":        "forgejo-sync",
-		"OIDC_CLIENT_SECRET":    "client_secret",
-		"OIDC_REDIRECT_URL":     "https://sync.example.com/auth/callback",
-		"SESSION_SECRET":        "session_secret_32_bytes_minimum",
-		// Legacy v1 configuration (optional for backward compat)
-		"FORGEJO_DATA_DIR":          "/var/lib/forgejo/data",
-		"FORGEJO_PUSH_SSH_KEY_PATH": "/etc/forgejo/push_key",
-		"FORGEJO_DOMAIN":            "forgejo.example.com",
-		"FORGEJO_SSH_PORT":          "2222",
-		"FORGEJO_DB_HOST":           "postgres.example.com",
-		"FORGEJO_DB_PORT":           "5432",
-		"FORGEJO_DB_USER":           "forgejo_ro",
-		"FORGEJO_DB_PASSWORD":       "secret_password",
-		"FORGEJO_DB_NAME":           "forgejo",
-		"FORGEJO_DB_SSLMODE":        "disable",
-		"WEBHOOK_LISTEN_ADDR":       ":9090",
-		"WEBHOOK_GITHUB_SECRET":     "gh_secret",
-		"WEBHOOK_GITLAB_SECRET":     "gl_secret",
-		"DASHBOARD_LISTEN_ADDR":     ":9091",
-		"FORGEJO_SECRET_KEY":        "secret",
+		"LISTEN_ADDR":        ":8080",
+		"CACHE_DIR":          "/var/cache/forgejo-sync",
+		"APP_DB_PATH":        "/var/lib/forgejo-sync/app.db",
+		"SSH_KEYS_DIR":       "/var/lib/forgejo-sync/keys",
+		"OIDC_ISSUER_URL":    "https://id.example.com",
+		"OIDC_CLIENT_ID":     "forgejo-sync",
+		"OIDC_CLIENT_SECRET": "client_secret",
+		"OIDC_REDIRECT_URL":  "https://sync.example.com/auth/callback",
+		"SESSION_SECRET":     "session_secret_32_bytes_minimum",
 	}
 }
 
@@ -124,6 +108,30 @@ func TestConfig_Load_Defaults(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" || cfg.ParsedLogLevel != slog.LevelInfo {
 		t.Errorf("expected default LogLevel info, got %q (%v)", cfg.LogLevel, cfg.ParsedLogLevel)
+	}
+}
+
+func TestConfig_Load_DevelopmentMode(t *testing.T) {
+	env := validEnvMap()
+	env["MODE"] = "development"
+	delete(env, "OIDC_ISSUER_URL")
+	delete(env, "OIDC_CLIENT_ID")
+	delete(env, "OIDC_CLIENT_SECRET")
+	delete(env, "OIDC_REDIRECT_URL")
+	delete(env, "SESSION_SECRET")
+
+	cfg, err := config.LoadFrom(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("unexpected error in development mode: %v", err)
+	}
+	if cfg.Mode != "development" {
+		t.Fatalf("expected MODE to be development, got %q", cfg.Mode)
+	}
+	if cfg.OIDCProviderName != "Development" {
+		t.Fatalf("expected development provider name, got %q", cfg.OIDCProviderName)
+	}
+	if cfg.SessionSecret != "development-session-secret-change-me" {
+		t.Fatalf("expected dev session secret default, got %q", cfg.SessionSecret)
 	}
 }
 

@@ -24,8 +24,30 @@ jobs:
       - name: Run Tests
         run: go test -v -race ./...
 
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: cd frontend && pnpm install
+
+      - name: Run Frontend Tests
+        run: cd frontend && pnpm exec ng test --watch=false
+
   build-and-push:
-    needs: test
+    needs: [test, test-frontend]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

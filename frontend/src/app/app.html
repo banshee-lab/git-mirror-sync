@@ -1,0 +1,82 @@
+<div class="min-h-screen bg-slate-950 text-slate-100">
+  <div class="app-shell">
+    @if (auth.currentUser()) {
+      @if (isMobile && !menuCollapsed) {
+        <button class="mobile-backdrop" type="button" (click)="toggleMenu()" aria-label="Close navigation"></button>
+      }
+
+      <aside
+        class="sidebar"
+        [class.sidebar--collapsed]="menuCollapsed"
+        [class.sidebar--mobile-open]="isMobile && !menuCollapsed"
+      >
+        <div class="sidebar__header">
+          <button
+            type="button"
+            (click)="toggleMenu()"
+            class="sidebar__toggle"
+            [attr.aria-label]="menuCollapsed ? 'Open navigation' : 'Close navigation'"
+            [attr.title]="menuCollapsed ? 'Open navigation' : 'Close navigation'"
+          >
+            <i class="fa-solid fa-bars"></i>
+          </button>
+
+          @if (!menuCollapsed) {
+            <div class="brand">
+              <div class="brand__icon">
+                <i class="fa-solid fa-cloud-arrow-up"></i>
+              </div>
+              <div class="brand__meta">
+                <div class="brand__title">Git Sync</div>
+                <div class="brand__version">v2</div>
+              </div>
+            </div>
+          }
+        </div>
+
+        <nav class="sidebar__nav" aria-label="Main navigation">
+          @for (item of navItems; track item.path) {
+            <a
+              [routerLink]="item.path"
+              routerLinkActive="bg-slate-800 text-white"
+              [routerLinkActiveOptions]="{ exact: item.exact }"
+              class="nav-link"
+              [attr.title]="item.label"
+            >
+              <i [class]="item.icon"></i>
+              <span class="nav-link__label">{{ item.label }}</span>
+            </a>
+          }
+        </nav>
+
+        <div class="sidebar__footer">
+          <div class="user-card" [class.user-card--collapsed]="menuCollapsed">
+            <div class="user-card__icon">
+              <i class="fa-solid fa-user-circle"></i>
+            </div>
+            @if (!menuCollapsed) {
+              <div class="user-card__details">
+                <div class="user-card__label">Signed in</div>
+                <div class="user-card__name">{{ auth.currentUser()?.name || auth.currentUser()?.email || 'Unknown user' }}</div>
+              </div>
+            }
+          </div>
+
+          <button
+            type="button"
+            (click)="auth.logout()"
+            class="signout-button"
+            [attr.title]="menuCollapsed ? 'Sign out' : null"
+          >
+            <i class="fa-solid fa-right-from-bracket"></i>
+            <span class="signout-button__label">Sign out</span>
+          </button>
+        </div>
+      </aside>
+    }
+
+    <main class="content">
+      <router-outlet />
+    </main>
+  </div>
+</div>

@@ -169,6 +169,13 @@ func (p *Pool) processJob(job syncJob) {
 
 	slog.Info("starting processing sync job", slog.Int64("eventID", job.eventID), slog.String("repo", job.repo.Name), slog.String("owner", job.repo.Owner))
 
+	timeout := p.cfg.GitCommandTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	jobCtx, jobCancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
+	defer jobCancel()
+
 	defer func() {
 		err := p.store.Finish(context.Background(), job.eventID, status, detail, commitAfter, time.Now().UTC())
 		if err != nil {
@@ -193,7 +200,7 @@ func (p *Pool) processJob(job syncJob) {
 	}
 
 	slog.Debug("looking up matching repositories in database", slog.Int64("eventID", job.eventID), slog.String("normalizedURL", normalizedURL))
-	matches, err := p.repoLookup.ListByPullURL(p.ctx, normalizedURL)
+	matches, err := p.repoLookup.ListByPullURL(jobCtx, normalizedURL)
 	if err != nil {
 		slog.Debug("database lookup failed with error", slog.Int64("eventID", job.eventID), slog.Any("error", err))
 		status = history.StatusError
@@ -213,11 +220,11 @@ func (p *Pool) processJob(job syncJob) {
 		if !repo.Enabled {
 			continue
 		}
-		if _, err := p.keyStore.Get(p.ctx, repo.PullSSHKeyID); err != nil {
+		if _, err := p.keyStore.Get(jobCtx, repo.PullSSHKeyID); err != nil {
 			slog.Warn("pull SSH key missing for repo", slog.Int64("eventID", job.eventID), slog.Int64("repoID", repo.ID), slog.Any("error", err))
 			continue
 		}
-		if _, err := p.keyStore.Get(p.ctx, repo.PushSSHKeyID); err != nil {
+		if _, err := p.keyStore.Get(jobCtx, repo.PushSSHKeyID); err != nil {
 			slog.Warn("push SSH key missing for repo", slog.Int64("eventID", job.eventID), slog.Int64("repoID", repo.ID), slog.Any("error", err))
 			continue
 		}
@@ -235,13 +242,13 @@ func (p *Pool) processJob(job syncJob) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	pullKey, err := p.keyStore.Get(p.ctx, matchedRepo.PullSSHKeyID)
+	pullKey, err := p.keyStore.Get(jobCtx, matchedRepo.PullSSHKeyID)
 	if err != nil {
 		status = history.StatusError
 		detail = fmt.Sprintf("Pull key lookup failed: %v", err)
 		return
 	}
-	pushKey, err := p.keyStore.Get(p.ctx, matchedRepo.PushSSHKeyID)
+	pushKey, err := p.keyStore.Get(jobCtx, matchedRepo.PushSSHKeyID)
 	if err != nil {
 		status = history.StatusError
 		detail = fmt.Sprintf("Push key lookup failed: %v", err)
@@ -254,7 +261,7 @@ func (p *Pool) processJob(job syncJob) {
 		SourceKeyPath: pullKey.PrivatePath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
-	cachePath, err := p.gitSyncer.SyncRepository(p.ctx, syncOpts)
+	cachePath, err := p.gitSyncer.SyncRepository(jobCtx, syncOpts)
 	if err != nil {
 		status = history.StatusError
 		detail = fmt.Sprintf("Sync failed: %v", err)
@@ -268,7 +275,7 @@ func (p *Pool) processJob(job syncJob) {
 		RemoteKeyPath: pushKey.PrivatePath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
-	pushResult, err := p.gitSyncer.PushToRemote(p.ctx, pushOpts)
+	pushResult, err := p.gitSyncer.PushToRemote(jobCtx, pushOpts)
 	if err != nil {
 		var conflictErr *gitsync.ErrConflict
 		if errors.As(err, &conflictErr) {

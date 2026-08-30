@@ -10,23 +10,19 @@ import (
 	"regexp"
 	"time"
 
-	"forgejo-sync/internal/forgejodb"
 	"forgejo-sync/internal/giturl"
 )
 
 // SyncOptions holds parameters required for cloning or fetching a repository.
 // All URLs are expected to be in SSH form (normalized by giturl package).
 type SyncOptions struct {
-	CacheDir       string
-	SourceURL      string
-	SourceKeyPath  string
-	Timeout        time.Duration
-	Provider       string
-	Owner          string
-	Repo           string
-	ForgejoDataDir string
-	MatchedRepo    *forgejodb.MatchedRepo
-	ForgejoSecret  string
+	CacheDir      string
+	SourceURL     string
+	SourceKeyPath string
+	Timeout       time.Duration
+	Provider      string
+	Owner         string
+	Repo          string
 }
 
 // GetCachePath returns the bare mirror cache path: <CACHE_DIR>/{hash-based-name}.git
@@ -142,4 +138,33 @@ func SyncRepository(ctx context.Context, opts SyncOptions) (string, error) {
 	}
 
 	return cachePath, nil
+}
+
+// LsRemote performs a lightweight git ls-remote to verify reachability and authentication.
+func LsRemote(ctx context.Context, remoteURL string, keyPath string, timeout time.Duration) error {
+	if remoteURL == "" {
+		return fmt.Errorf("remote URL cannot be empty")
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	sshCmd := ResolveSSHCommand(keyPath)
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", remoteURL)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND="+sshCmd)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		sanitized := sanitizeString(stderr.String() + stdout.String())
+		if sanitized == "" {
+			sanitized = err.Error()
+		}
+		return fmt.Errorf("git ls-remote failed: %s", sanitized)
+	}
+	return nil
 }

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -355,6 +356,93 @@ func TestRepositoryListByPullURL(t *testing.T) {
 		if r.PullURLSSH != pullURL {
 			t.Errorf("expected pull URL %q, got %q", pullURL, r.PullURLSSH)
 		}
+	}
+}
+
+func TestRepositoryListPageAndLastSync(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	repos := db.Repositories()
+	keyStore := db.SSHKeys()
+	eventStore := db.SyncEvents()
+
+	key, err := keyStore.Create(ctx, store.SSHKey{
+		Name:        "key-page",
+		KeyType:     "ed25519",
+		PrivatePath: "k",
+		PublicPath:  "k.pub",
+		Fingerprint: "fp",
+	})
+	if err != nil {
+		t.Fatalf("failed to create key: %v", err)
+	}
+
+	for i := 1; i <= 5; i++ {
+		_, err := repos.Create(ctx, store.Repository{
+			Name:             fmt.Sprintf("repo-page-%d", i),
+			PullURLRaw:       "git@github.com:owner/src",
+			PullURLSSH:       fmt.Sprintf("ssh://git@github.com/owner/src%d.git", i),
+			PullSSHKeyID:     key.ID,
+			PushURLRaw:       "git@gitlab.com:owner/dest",
+			PushURLSSH:       fmt.Sprintf("ssh://git@gitlab.com/owner/dest%d.git", i),
+			PushSSHKeyID:     key.ID,
+			WebhookSecHash:   "hash",
+			ProviderHint:     "github",
+			PushProviderHint: "gitlab",
+			Enabled:          true,
+		})
+		if err != nil {
+			t.Fatalf("create repo: %v", err)
+		}
+	}
+
+	// Insert sync event for repo-page-1
+	now := time.Now().UTC().Truncate(time.Second)
+	_, err = eventStore.Create(ctx, store.SyncEvent{
+		ReceivedAt:   now,
+		FinishedAt:   now.Add(time.Second),
+		Provider:     "github",
+		RepoFullName: "repo-page-1",
+		Status:       "success",
+		Detail:       "synced",
+	})
+	if err != nil {
+		t.Fatalf("create sync event: %v", err)
+	}
+
+	// Test ListPage with search
+	items, total, err := repos.ListPage(ctx, "repo-page-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListPage error: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("expected total 1, got %d", total)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].LastSyncStatus != "success" {
+		t.Errorf("expected LastSyncStatus 'success', got %q", items[0].LastSyncStatus)
+	}
+	if items[0].LastSyncAt == nil {
+		t.Errorf("expected LastSyncAt to be non-nil")
+	}
+	if items[0].PushProviderHint != "gitlab" {
+		t.Errorf("expected PushProviderHint 'gitlab', got %q", items[0].PushProviderHint)
+	}
+
+	// Test ListPage pagination
+	page1, totalAll, err := repos.ListPage(ctx, "", 2, 0)
+	if err != nil {
+		t.Fatalf("ListPage error: %v", err)
+	}
+	if totalAll != 5 {
+		t.Errorf("expected totalAll 5, got %d", totalAll)
+	}
+	if len(page1) != 2 {
+		t.Errorf("expected 2 items, got %d", len(page1))
 	}
 }
 

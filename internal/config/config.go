@@ -13,44 +13,26 @@ import (
 
 // Config holds all configuration loaded from environment variables.
 type Config struct {
-	// v2 settings (new)
-	ListenAddr     string
-	CacheDir       string
-	AppDBPath      string // SQLite database for repositories, ssh_keys, and sync_events
-	SSHKeysDir     string
+	Mode              string
+	ListenAddr        string
+	CacheDir          string
+	AppDBPath         string
+	SSHKeysDir        string
 	WorkerConcurrency int
 	GitCommandTimeout time.Duration
-	LogLevel       string
-	ParsedLogLevel slog.Level
+	LogLevel          string
+	ParsedLogLevel    slog.Level
 
-	// OIDC settings (v2)
-	OIDCIssuerURL    string
-	OIDCClientID     string
-	OIDCClientSecret string
-	OIDCRedirectURL  string
-	OIDCScopes       string
-	OIDCProviderName string
-	SessionSecret    string
+	OIDCIssuerURL     string
+	OIDCClientID      string
+	OIDCClientSecret  string
+	OIDCRedirectURL   string
+	OIDCScopes        string
+	OIDCProviderName  string
+	SessionSecret     string
 	SessionCookieName string
-	SessionTTL       time.Duration
+	SessionTTL        time.Duration
 
-	// Legacy v1 settings (deprecated, to be removed)
-	ForgejoDataDir         string
-	ForgejoPushSSHKeyPath  string
-	ForgejoDomain          string
-	ForgejoSSHPort         int
-	ForgejoDBHost          string
-	ForgejoDBPort          int
-	ForgejoDBUser          string
-	ForgejoDBPassword      string
-	ForgejoDBName          string
-	ForgejoDBSSLMode       string
-	ForgejoSecret          string
-	WebhookListenAddr      string
-	WebhookGitHubSecret    string
-	WebhookGitLabSecret    string
-	HistoryDBPath          string
-	DashboardListenAddr    string
 }
 
 // Load reads and validates configuration from environment variables.
@@ -114,17 +96,32 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 	cfg.CacheDir = getRequired("CACHE_DIR")
 	cfg.AppDBPath = getOptional("APP_DB_PATH", filepath.Join(cfg.CacheDir, "app.db"))
 	cfg.SSHKeysDir = getRequired("SSH_KEYS_DIR")
-
-	// v2 OIDC configuration
-	cfg.OIDCIssuerURL = getRequired("OIDC_ISSUER_URL")
-	cfg.OIDCClientID = getRequired("OIDC_CLIENT_ID")
-	cfg.OIDCClientSecret = getRequired("OIDC_CLIENT_SECRET")
-	cfg.OIDCRedirectURL = getRequired("OIDC_REDIRECT_URL")
-	cfg.OIDCScopes = getOptional("OIDC_SCOPES", "openid profile email")
-	cfg.OIDCProviderName = getOptional("OIDC_PROVIDER_NAME", "PocketID")
-	cfg.SessionSecret = getRequired("SESSION_SECRET")
-	cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
-	cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
+	cfg.Mode = strings.ToLower(strings.TrimSpace(getenv("MODE")))
+	if cfg.Mode == "development" || cfg.Mode == "dev" {
+		cfg.OIDCIssuerURL = getOptional("OIDC_ISSUER_URL", "https://development.invalid")
+		cfg.OIDCClientID = getOptional("OIDC_CLIENT_ID", "dev-client")
+		cfg.OIDCClientSecret = getOptional("OIDC_CLIENT_SECRET", "dev-secret")
+		cfg.OIDCRedirectURL = getOptional("OIDC_REDIRECT_URL", "http://localhost:8080/auth/callback")
+		cfg.OIDCScopes = getOptional("OIDC_SCOPES", "openid profile email")
+		cfg.OIDCProviderName = getOptional("OIDC_PROVIDER_NAME", "Development")
+		cfg.SessionSecret = getOptional("SESSION_SECRET", "development-session-secret-change-me")
+		cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
+		cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
+	} else {
+		cfg.Mode = "production"
+		cfg.OIDCIssuerURL = getRequired("OIDC_ISSUER_URL")
+		cfg.OIDCClientID = getRequired("OIDC_CLIENT_ID")
+		cfg.OIDCClientSecret = getRequired("OIDC_CLIENT_SECRET")
+		cfg.OIDCRedirectURL = getRequired("OIDC_REDIRECT_URL")
+		cfg.OIDCScopes = getOptional("OIDC_SCOPES", "openid profile email")
+		cfg.OIDCProviderName = getOptional("OIDC_PROVIDER_NAME", "PocketID")
+		cfg.SessionSecret = getRequired("SESSION_SECRET")
+		if len(cfg.SessionSecret) < 16 {
+			errs = append(errs, errors.New("SESSION_SECRET must be at least 16 characters in production mode"))
+		}
+		cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
+		cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
+	}
 
 	// Worker and git settings
 	cfg.WorkerConcurrency = getOptionalInt("WORKER_CONCURRENCY", 4)
@@ -151,24 +148,6 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 	default:
 		errs = append(errs, fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error; got %q", logLevelStr))
 	}
-
-	// Legacy v1 configuration (kept for backward compatibility during migration, will be removed)
-	cfg.ForgejoDataDir = getOptional("FORGEJO_DATA_DIR", "")
-	cfg.ForgejoPushSSHKeyPath = getOptional("FORGEJO_PUSH_SSH_KEY_PATH", "")
-	cfg.ForgejoDomain = getOptional("FORGEJO_DOMAIN", "")
-	cfg.ForgejoSSHPort = getOptionalInt("FORGEJO_SSH_PORT", 22)
-	cfg.ForgejoDBHost = getOptional("FORGEJO_DB_HOST", "")
-	cfg.ForgejoDBPort = getOptionalInt("FORGEJO_DB_PORT", 5432)
-	cfg.ForgejoDBUser = getOptional("FORGEJO_DB_USER", "")
-	cfg.ForgejoDBPassword = getOptional("FORGEJO_DB_PASSWORD", "")
-	cfg.ForgejoDBName = getOptional("FORGEJO_DB_NAME", "")
-	cfg.ForgejoDBSSLMode = getOptional("FORGEJO_DB_SSLMODE", "")
-	cfg.ForgejoSecret = getOptional("FORGEJO_SECRET_KEY", "")
-	cfg.WebhookListenAddr = getOptional("WEBHOOK_LISTEN_ADDR", "")
-	cfg.WebhookGitHubSecret = getOptional("WEBHOOK_GITHUB_SECRET", "")
-	cfg.WebhookGitLabSecret = getOptional("WEBHOOK_GITLAB_SECRET", "")
-	cfg.HistoryDBPath = getOptional("HISTORY_DB_PATH", "")
-	cfg.DashboardListenAddr = getOptional("DASHBOARD_LISTEN_ADDR", "")
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)

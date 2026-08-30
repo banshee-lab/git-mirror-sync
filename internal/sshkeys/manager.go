@@ -2,6 +2,8 @@ package sshkeys
 
 import (
 	"bytes"
+	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -46,7 +48,7 @@ func NewManager(keysDir string, keyStore store.SSHKeyStore, repoStore store.Repo
 
 // GenerateKeyPair generates a new SSH key pair and stores it.
 // Returns the created SSHKey record and any error.
-func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, error) {
+func (m *Manager) GenerateKeyPair(ctx context.Context, keyType KeyType, name string) (store.SSHKey, error) {
 	m.logger.Info("generating SSH key pair",
 		"name", name,
 		"type", string(keyType),
@@ -57,7 +59,10 @@ func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, e
 	}
 
 	// Generate the key material
-	var privateKeySigner ssh.Signer
+	var (
+		rawPrivateKey crypto.PrivateKey
+		publicKey     ssh.PublicKey
+	)
 
 	switch keyType {
 	case KeyTypeEd25519:
@@ -66,13 +71,13 @@ func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, e
 			return store.SSHKey{}, fmt.Errorf("failed to generate ed25519 key: %w", err)
 		}
 
-		signer, err := ssh.NewSignerFromKey(priv)
+		sshPub, err := ssh.NewPublicKey(pub)
 		if err != nil {
-			return store.SSHKey{}, fmt.Errorf("failed to create signer: %w", err)
+			return store.SSHKey{}, fmt.Errorf("failed to create public key: %w", err)
 		}
 
-		privateKeySigner = signer
-		_ = pub // use for public key via signer
+		rawPrivateKey = priv
+		publicKey = sshPub
 
 	case KeyTypeRSA:
 		privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
@@ -80,23 +85,24 @@ func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, e
 			return store.SSHKey{}, fmt.Errorf("failed to generate RSA key: %w", err)
 		}
 
-		signer, err := ssh.NewSignerFromKey(privateKey)
+		sshPub, err := ssh.NewPublicKey(&privateKey.PublicKey)
 		if err != nil {
-			return store.SSHKey{}, fmt.Errorf("failed to create signer: %w", err)
+			return store.SSHKey{}, fmt.Errorf("failed to create public key: %w", err)
 		}
 
-		privateKeySigner = signer
+		rawPrivateKey = privateKey
+		publicKey = sshPub
 
 	default:
 		return store.SSHKey{}, fmt.Errorf("unsupported key type: %v", keyType)
 	}
 
 	// Generate public key line
-	publicKeyLine := string(ssh.MarshalAuthorizedKey(privateKeySigner.PublicKey()))
-	fingerprint := ssh.FingerprintSHA256(privateKeySigner.PublicKey())
+	publicKeyLine := string(ssh.MarshalAuthorizedKey(publicKey))
+	fingerprint := ssh.FingerprintSHA256(publicKey)
 
 	// Generate private key in OpenSSH format
-	privateKeyBlock, marshalErr := ssh.MarshalPrivateKey(privateKeySigner, "")
+	privateKeyBlock, marshalErr := ssh.MarshalPrivateKey(rawPrivateKey, "")
 	if marshalErr != nil {
 		return store.SSHKey{}, fmt.Errorf("failed to marshal private key: %w", marshalErr)
 	}
@@ -137,7 +143,10 @@ func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, e
 		Fingerprint: fingerprint,
 	}
 
-	createdKey, err := m.keyStore.Create(nil, key) // TODO: pass context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	createdKey, err := m.keyStore.Create(ctx, key)
 	if err != nil {
 		os.Remove(privateKeyPath)
 		os.Remove(publicKeyPath)
@@ -154,8 +163,11 @@ func (m *Manager) GenerateKeyPair(keyType KeyType, name string) (store.SSHKey, e
 }
 
 // GetPublicKey retrieves the public key content for display/copy.
-func (m *Manager) GetPublicKey(keyID int64) (string, error) {
-	key, err := m.keyStore.Get(nil, keyID) // TODO: pass context
+func (m *Manager) GetPublicKey(ctx context.Context, keyID int64) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key, err := m.keyStore.Get(ctx, keyID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get key: %w", err)
 	}
@@ -170,14 +182,17 @@ func (m *Manager) GetPublicKey(keyID int64) (string, error) {
 }
 
 // Delete removes an SSH key if it's not in use by any repository.
-func (m *Manager) Delete(keyID int64) error {
-	key, err := m.keyStore.Get(nil, keyID) // TODO: pass context
+func (m *Manager) Delete(ctx context.Context, keyID int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key, err := m.keyStore.Get(ctx, keyID)
 	if err != nil {
 		return fmt.Errorf("failed to get key: %w", err)
 	}
 
 	// Check if key is in use
-	inUse, err := m.keyStore.IsKeyInUse(nil, keyID) // TODO: pass context
+	inUse, err := m.keyStore.IsKeyInUse(ctx, keyID)
 	if err != nil {
 		return fmt.Errorf("failed to check key usage: %w", err)
 	}
@@ -207,7 +222,7 @@ func (m *Manager) Delete(keyID int64) error {
 	}
 
 	// Delete from database
-	if err := m.keyStore.Delete(nil, keyID); err != nil { // TODO: pass context
+	if err := m.keyStore.Delete(ctx, keyID); err != nil {
 		return fmt.Errorf("failed to delete key from database: %w", err)
 	}
 
@@ -221,8 +236,11 @@ func (m *Manager) Delete(keyID int64) error {
 
 // GetPrivateKeyPath returns the filesystem path to the private key.
 // Used by git operations that need to set GIT_SSH_COMMAND.
-func (m *Manager) GetPrivateKeyPath(keyID int64) (string, error) {
-	key, err := m.keyStore.Get(nil, keyID) // TODO: pass context
+func (m *Manager) GetPrivateKeyPath(ctx context.Context, keyID int64) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key, err := m.keyStore.Get(ctx, keyID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get key: %w", err)
 	}
