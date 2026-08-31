@@ -1,3 +1,4 @@
 .env
 PLAN.md
-**/webapp/dist/
+**/webapp/dist/*
+!**/webapp/dist/.gitkeep

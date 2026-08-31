@@ -11,6 +11,12 @@ import (
 //go:embed all:dist
 var embedded embed.FS
 
+const unavailableIndexHTML = `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Forgejo Sync</title></head>
+<body><h1>Forgejo Sync</h1><p>Frontend assets are not available.</p></body>
+</html>`
+
 func resolveDistRoot(root fs.FS) (fs.FS, error) {
 	candidates := []string{"dist"}
 	for _, candidate := range candidates {
@@ -29,10 +35,7 @@ func resolveDistRoot(root fs.FS) (fs.FS, error) {
 func NewHandler() (http.Handler, error) {
 	rootFS, err := resolveDistRoot(embedded)
 	if err != nil {
-		fallback, readErr := fs.ReadFile(embedded, "index.html")
-		if readErr != nil {
-			return nil, fmt.Errorf("prepare embedded dist fs: %w", err)
-		}
+		fallback := []byte(unavailableIndexHTML)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -40,7 +43,9 @@ func NewHandler() (http.Handler, error) {
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(fallback)
+			if r.Method == http.MethodGet {
+				_, _ = w.Write(fallback)
+			}
 		}), nil
 	}
 
