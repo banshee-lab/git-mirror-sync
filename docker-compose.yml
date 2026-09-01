@@ -9,6 +9,7 @@ services:
       APP_DB_PATH: /var/cache/forgejo-sync/app.db
       SSH_KEYS_DIR: /var/cache/forgejo-sync/keys
       MODE: development
+      LOG_LEVEL: debug
     volumes:
       - cache_data:/var/cache/forgejo-sync
     healthcheck:

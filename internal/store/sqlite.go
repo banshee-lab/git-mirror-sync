@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -70,14 +71,17 @@ CREATE INDEX IF NOT EXISTS idx_sync_events_received_at ON sync_events(received_a
 
 // NewDB creates a new database connection and initializes the schema.
 func NewDB(dbPath string) (*DB, error) {
+	slog.Debug("store.NewDB: opening SQLite database", slog.String("db_path", dbPath))
 	sqldb, err := sql.Open("sqlite", dbPath)
 	if err != nil {
+		slog.Debug("store.NewDB: failed to open SQLite database", slog.String("db_path", dbPath), slog.Any("error", err))
 		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
 	}
 
 	// Enable foreign keys, WAL mode, and busy timeout
 	if _, err := sqldb.Exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"); err != nil {
 		sqldb.Close()
+		slog.Debug("store.NewDB: failed to configure pragmas", slog.Any("error", err))
 		return nil, fmt.Errorf("failed to configure SQLite pragmas: %w", err)
 	}
 
@@ -86,9 +90,11 @@ func NewDB(dbPath string) (*DB, error) {
 	// Initialize schema
 	if err := db.initSchema(); err != nil {
 		sqldb.Close()
+		slog.Debug("store.NewDB: failed to initialize schema", slog.Any("error", err))
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	slog.Debug("store.NewDB: SQLite database opened and initialized", slog.String("db_path", dbPath))
 	return db, nil
 }
 
@@ -97,15 +103,18 @@ func (db *DB) initSchema() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	slog.Debug("store.DB: executing schema migration")
 	if _, err := db.conn.Exec(schema); err != nil {
 		return err
 	}
 	_, _ = db.conn.Exec("ALTER TABLE repositories ADD COLUMN push_provider_hint TEXT")
+	slog.Debug("store.DB: schema migration completed")
 	return nil
 }
 
 // Close closes the database connection.
 func (db *DB) Close() error {
+	slog.Debug("store.DB: closing database connection")
 	return db.conn.Close()
 }
 

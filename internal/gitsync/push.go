@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -58,10 +59,22 @@ var (
 
 // PushToRemote pushes the bare mirror cache to a remote SSH URL without force.
 func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
+	start := time.Now()
+	slog.Debug("gitsync.PushToRemote started",
+		slog.String("cache_path", opts.CachePath),
+		slog.String("remote_url", opts.RemoteURL),
+		slog.String("remote_key_path", opts.RemoteKeyPath),
+		slog.Duration("timeout", opts.Timeout),
+		slog.String("owner", opts.Owner),
+		slog.String("repo", opts.Repo),
+	)
+
 	if opts.CachePath == "" {
+		slog.Debug("gitsync.PushToRemote failed: empty cache path")
 		return nil, fmt.Errorf("cache path cannot be empty")
 	}
 	if opts.RemoteURL == "" {
+		slog.Debug("gitsync.PushToRemote failed: empty remote URL")
 		return nil, fmt.Errorf("remote URL cannot be empty")
 	}
 
@@ -73,6 +86,7 @@ func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
 	defer cancel()
 
 	sshCmd := ResolveSSHCommand(opts.RemoteKeyPath)
+	slog.Debug("gitsync.PushToRemote resolved SSH command", slog.String("ssh_cmd", sshCmd))
 
 	cmd := exec.CommandContext(ctx, "git", "-C", opts.CachePath, "push", opts.RemoteURL, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
@@ -82,6 +96,11 @@ func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	slog.Debug("gitsync.PushToRemote executing git push",
+		slog.String("cache_path", opts.CachePath),
+		slog.String("remote_url", opts.RemoteURL),
+	)
+
 	err := cmd.Run()
 	outputStr := sanitizeString(stderr.String() + stdout.String())
 
@@ -89,9 +108,19 @@ func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
 		lowerOut := strings.ToLower(outputStr)
 		for _, ind := range conflictIndicators {
 			if strings.Contains(lowerOut, strings.ToLower(ind)) {
+				slog.Debug("gitsync.PushToRemote detected conflict",
+					slog.Duration("duration", time.Since(start)),
+					slog.String("conflict_indicator", ind),
+					slog.String("output", outputStr),
+				)
 				return nil, &ErrConflict{Detail: strings.TrimSpace(outputStr)}
 			}
 		}
+		slog.Debug("gitsync.PushToRemote failed",
+			slog.Duration("duration", time.Since(start)),
+			slog.String("output", outputStr),
+			slog.Any("error", err),
+		)
 		return nil, fmt.Errorf("git push failed: %w (output: %s)", err, strings.TrimSpace(outputStr))
 	}
 
@@ -104,6 +133,13 @@ func PushToRemote(ctx context.Context, opts PushOptions) (*PushResult, error) {
 		result.BeforeSHA = matches[1]
 		result.AfterSHA = matches[2]
 	}
+
+	slog.Debug("gitsync.PushToRemote succeeded",
+		slog.Duration("duration", time.Since(start)),
+		slog.String("before_sha", result.BeforeSHA),
+		slog.String("after_sha", result.AfterSHA),
+		slog.String("raw_output", result.RawOutput),
+	)
 
 	return result, nil
 }

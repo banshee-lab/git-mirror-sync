@@ -99,12 +99,28 @@ func (p *Pool) getRepoLock(repoID int64) *sync.Mutex {
 
 // Enqueue implements webhook.JobEnqueuer.
 func (p *Pool) Enqueue(ctx context.Context, repo webhook.RepoInfo, eventID int64) error {
+	slog.Debug("worker.Pool.Enqueue requested",
+		slog.Int64("eventID", eventID),
+		slog.String("repo", repo.FullName),
+		slog.String("provider", repo.Provider),
+		slog.Int("queue_len", len(p.jobCh)),
+		slog.Int("queue_cap", cap(p.jobCh)),
+	)
 	select {
 	case <-p.ctx.Done():
+		slog.Debug("worker.Pool.Enqueue rejected: shutting down", slog.Int64("eventID", eventID))
 		return errors.New("worker pool is shutting down")
 	case p.jobCh <- syncJob{repo: repo, eventID: eventID}:
+		slog.Debug("worker.Pool.Enqueue succeeded",
+			slog.Int64("eventID", eventID),
+			slog.Int("queue_len", len(p.jobCh)),
+		)
 		return nil
 	default:
+		slog.Debug("worker.Pool.Enqueue rejected: queue full",
+			slog.Int64("eventID", eventID),
+			slog.Int("queue_len", len(p.jobCh)),
+		)
 		return errors.New("worker pool job channel is full")
 	}
 }
@@ -116,6 +132,11 @@ func (p *Pool) Start() {
 		concurrency = 4
 	}
 
+	slog.Debug("worker.Pool.Start initiating workers",
+		slog.Int("concurrency", concurrency),
+		slog.Int("queue_cap", cap(p.jobCh)),
+	)
+
 	for i := 0; i < concurrency; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
@@ -123,21 +144,27 @@ func (p *Pool) Start() {
 
 	p.wg.Add(1)
 	go p.pruner()
+	slog.Debug("worker.Pool.Start all workers and pruner started")
 }
 
 // Shutdown initiates a graceful shutdown and waits for workers to finish.
 func (p *Pool) Shutdown() {
+	slog.Debug("worker.Pool.Shutdown initiated")
 	p.cancel()
 	p.wg.Wait()
+	slog.Debug("worker.Pool.Shutdown completed")
 }
 
 func (p *Pool) worker(id int) {
 	defer p.wg.Done()
+	slog.Debug("worker routine started", slog.Int("worker_id", id))
 	for {
 		select {
 		case <-p.ctx.Done():
+			slog.Debug("worker routine stopping", slog.Int("worker_id", id))
 			return
 		case job := <-p.jobCh:
+			slog.Debug("worker picked up job", slog.Int("worker_id", id), slog.Int64("eventID", job.eventID), slog.String("repo", job.repo.FullName))
 			p.processJob(job)
 		}
 	}
@@ -148,15 +175,19 @@ func (p *Pool) pruner() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 
+	slog.Debug("pruner routine started")
 	for {
 		select {
 		case <-p.ctx.Done():
+			slog.Debug("pruner routine stopping")
 			return
 		case <-ticker.C:
-			// Prune history older than 30 days
-			_, err := p.store.Prune(p.ctx, 30*24*time.Hour)
+			slog.Debug("pruner tick firing: pruning history older than 30 days")
+			pruned, err := p.store.Prune(p.ctx, 30*24*time.Hour)
 			if err != nil {
 				slog.Error("failed to prune history", slog.Any("error", err))
+			} else {
+				slog.Debug("pruned expired history records", slog.Int64("pruned_count", pruned))
 			}
 		}
 	}
@@ -167,7 +198,16 @@ func (p *Pool) processJob(job syncJob) {
 	detail := ""
 	commitAfter := ""
 
-	slog.Info("starting processing sync job", slog.Int64("eventID", job.eventID), slog.String("repo", job.repo.Name), slog.String("owner", job.repo.Owner))
+	slog.Info("starting processing sync job",
+		slog.Int64("eventID", job.eventID),
+		slog.String("repo", job.repo.Name),
+		slog.String("owner", job.repo.Owner),
+		slog.String("ref", job.repo.Ref),
+		slog.String("before", job.repo.Before),
+		slog.String("after", job.repo.After),
+		slog.String("clone_url", job.repo.CloneURL),
+		slog.String("ssh_url", job.repo.SSHURL),
+	)
 
 	timeout := p.cfg.GitCommandTimeout
 	if timeout <= 0 {
@@ -176,12 +216,19 @@ func (p *Pool) processJob(job syncJob) {
 	jobCtx, jobCancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
 	defer jobCancel()
 
+	start := time.Now()
 	defer func() {
 		err := p.store.Finish(context.Background(), job.eventID, status, detail, commitAfter, time.Now().UTC())
 		if err != nil {
 			slog.Error("failed to finish history row", slog.Int64("eventID", job.eventID), slog.Any("error", err))
 		}
-		slog.Info("finished processing sync job", slog.Int64("eventID", job.eventID), slog.Any("status", status))
+		slog.Info("finished processing sync job",
+			slog.Int64("eventID", job.eventID),
+			slog.Any("status", status),
+			slog.String("detail", detail),
+			slog.String("commit_after", commitAfter),
+			slog.Duration("duration", time.Since(start)),
+		)
 	}()
 
 	normalizedURL := job.repo.CloneURL
@@ -190,13 +237,23 @@ func (p *Pool) processJob(job syncJob) {
 	}
 	if normalizedURL != "" {
 		var err error
+		rawURL := normalizedURL
 		normalizedURL, err = giturl.NormalizeToSSH(normalizedURL, "git")
 		if err != nil {
-			slog.Debug("failed to normalize webhook URL, skipping repo lookup", slog.Int64("eventID", job.eventID), slog.String("url", normalizedURL), slog.Any("error", err))
+			slog.Debug("failed to normalize webhook URL, skipping repo lookup",
+				slog.Int64("eventID", job.eventID),
+				slog.String("raw_url", rawURL),
+				slog.Any("error", err),
+			)
 			status = history.StatusSkipped
 			detail = "No matching repository found"
 			return
 		}
+		slog.Debug("normalized webhook URL for lookup",
+			slog.Int64("eventID", job.eventID),
+			slog.String("raw_url", rawURL),
+			slog.String("normalized_url", normalizedURL),
+		)
 	}
 
 	slog.Debug("looking up matching repositories in database", slog.Int64("eventID", job.eventID), slog.String("normalizedURL", normalizedURL))
@@ -207,6 +264,7 @@ func (p *Pool) processJob(job syncJob) {
 		detail = fmt.Sprintf("Lookup failed: %v", err)
 		return
 	}
+	slog.Debug("database lookup returned candidates", slog.Int64("eventID", job.eventID), slog.Int("match_count", len(matches)))
 	if len(matches) == 0 {
 		slog.Debug("no matching repository found in database", slog.Int64("eventID", job.eventID), slog.String("url", normalizedURL))
 		status = history.StatusSkipped
@@ -217,7 +275,14 @@ func (p *Pool) processJob(job syncJob) {
 	var matchedRepo *store.Repository
 	for i := range matches {
 		repo := &matches[i]
+		slog.Debug("evaluating candidate repository",
+			slog.Int64("eventID", job.eventID),
+			slog.Int64("repoID", repo.ID),
+			slog.String("repoName", repo.Name),
+			slog.Bool("enabled", repo.Enabled),
+		)
 		if !repo.Enabled {
+			slog.Debug("skipping disabled candidate repository", slog.Int64("repoID", repo.ID))
 			continue
 		}
 		if _, err := p.keyStore.Get(jobCtx, repo.PullSSHKeyID); err != nil {
@@ -232,28 +297,49 @@ func (p *Pool) processJob(job syncJob) {
 		break
 	}
 	if matchedRepo == nil {
+		slog.Debug("no enabled runnable repository matched", slog.Int64("eventID", job.eventID))
 		status = history.StatusSkipped
 		detail = "No runnable repository match found"
 		return
 	}
 
-	slog.Debug("found matching repository in database", slog.Int64("eventID", job.eventID), slog.Int64("repoID", matchedRepo.ID), slog.String("repoName", matchedRepo.Name))
+	slog.Debug("selected matching repository for sync",
+		slog.Int64("eventID", job.eventID),
+		slog.Int64("repoID", matchedRepo.ID),
+		slog.String("repoName", matchedRepo.Name),
+		slog.String("pull_url_ssh", matchedRepo.PullURLSSH),
+		slog.String("push_url_ssh", matchedRepo.PushURLSSH),
+	)
+
+	slog.Debug("acquiring repository execution lock", slog.Int64("repoID", matchedRepo.ID))
 	mu := p.getRepoLock(matchedRepo.ID)
 	mu.Lock()
-	defer mu.Unlock()
+	slog.Debug("repository execution lock acquired", slog.Int64("repoID", matchedRepo.ID))
+	defer func() {
+		mu.Unlock()
+		slog.Debug("repository execution lock released", slog.Int64("repoID", matchedRepo.ID))
+	}()
 
 	pullKey, err := p.keyStore.Get(jobCtx, matchedRepo.PullSSHKeyID)
 	if err != nil {
+		slog.Debug("pull key lookup failed", slog.Int64("repoID", matchedRepo.ID), slog.Any("error", err))
 		status = history.StatusError
 		detail = fmt.Sprintf("Pull key lookup failed: %v", err)
 		return
 	}
 	pushKey, err := p.keyStore.Get(jobCtx, matchedRepo.PushSSHKeyID)
 	if err != nil {
+		slog.Debug("push key lookup failed", slog.Int64("repoID", matchedRepo.ID), slog.Any("error", err))
 		status = history.StatusError
 		detail = fmt.Sprintf("Push key lookup failed: %v", err)
 		return
 	}
+
+	slog.Debug("resolved repository keys",
+		slog.Int64("repoID", matchedRepo.ID),
+		slog.String("pull_key_file", pullKey.PrivatePath),
+		slog.String("push_key_file", pushKey.PrivatePath),
+	)
 
 	syncOpts := gitsync.SyncOptions{
 		CacheDir:      p.cfg.CacheDir,
@@ -261,13 +347,15 @@ func (p *Pool) processJob(job syncJob) {
 		SourceKeyPath: pullKey.PrivatePath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
+	slog.Debug("executing SyncRepository in worker", slog.Int64("eventID", job.eventID), slog.String("source_url", syncOpts.SourceURL))
 	cachePath, err := p.gitSyncer.SyncRepository(jobCtx, syncOpts)
 	if err != nil {
 		status = history.StatusError
 		detail = fmt.Sprintf("Sync failed: %v", err)
-		slog.Error(detail)
+		slog.Error("worker sync repository step failed", slog.Int64("eventID", job.eventID), slog.String("detail", detail))
 		return
 	}
+	slog.Debug("worker sync repository step succeeded", slog.Int64("eventID", job.eventID), slog.String("cache_path", cachePath))
 
 	pushOpts := gitsync.PushOptions{
 		CachePath:     cachePath,
@@ -275,19 +363,27 @@ func (p *Pool) processJob(job syncJob) {
 		RemoteKeyPath: pushKey.PrivatePath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
+	slog.Debug("executing PushToRemote in worker", slog.Int64("eventID", job.eventID), slog.String("remote_url", pushOpts.RemoteURL))
 	pushResult, err := p.gitSyncer.PushToRemote(jobCtx, pushOpts)
 	if err != nil {
 		var conflictErr *gitsync.ErrConflict
 		if errors.As(err, &conflictErr) {
 			status = history.StatusConflict
 			detail = conflictErr.Detail
+			slog.Warn("worker push detected conflict", slog.Int64("eventID", job.eventID), slog.String("detail", detail))
 		} else {
 			status = history.StatusError
 			detail = fmt.Sprintf("Push failed: %v", err)
+			slog.Error("worker push failed", slog.Int64("eventID", job.eventID), slog.String("detail", detail))
 		}
-		slog.Error(detail)
 		return
 	}
+
+	slog.Debug("worker push succeeded",
+		slog.Int64("eventID", job.eventID),
+		slog.String("before_sha", pushResult.BeforeSHA),
+		slog.String("after_sha", pushResult.AfterSHA),
+	)
 
 	status = history.StatusSuccess
 	detail = pushResult.RawOutput

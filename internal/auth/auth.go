@@ -80,13 +80,25 @@ func NewProvider(cfg Config) (*Provider, error) {
 			cfg.ProviderName = "PocketID"
 		}
 	}
+
+	cfg.Logger.Debug("auth: initializing provider",
+		slog.String("mode", cfg.Mode),
+		slog.String("issuer_url", cfg.IssuerURL),
+		slog.String("client_id", cfg.ClientID),
+		slog.String("provider_name", cfg.ProviderName),
+		slog.String("session_cookie", cfg.SessionCookie),
+		slog.Duration("session_ttl", cfg.SessionTTL),
+	)
+
 	if strings.EqualFold(cfg.Mode, "development") || strings.EqualFold(cfg.Mode, "dev") {
+		cfg.Logger.Debug("auth: running in development authentication mode")
 		return &Provider{cfg: cfg, logger: cfg.Logger, devMode: true}, nil
 	}
 
 	ctx := context.Background()
 	issuer, err := oidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
+		cfg.Logger.Debug("auth: failed to discover oidc provider", slog.String("issuer_url", cfg.IssuerURL), slog.Any("error", err))
 		return nil, fmt.Errorf("oidc provider: %w", err)
 	}
 
@@ -103,6 +115,7 @@ func NewProvider(cfg Config) (*Provider, error) {
 		verifier: verifier,
 		logger:   cfg.Logger,
 	}
+	cfg.Logger.Debug("auth: oidc provider initialized successfully")
 
 	return provider, nil
 }
@@ -124,11 +137,30 @@ func RequireAuth(provider *Provider, next http.Handler) http.Handler {
 		if err != nil {
 			if provider != nil && provider.devMode {
 				user = provider.devUser()
+				if provider.logger != nil {
+					provider.logger.Debug("auth: RequireAuth bypassed for dev mode",
+						slog.String("path", r.URL.Path),
+						slog.String("user", user.Subject),
+					)
+				}
 			} else {
+				if provider != nil && provider.logger != nil {
+					provider.logger.Debug("auth: RequireAuth unauthorized",
+						slog.String("path", r.URL.Path),
+						slog.Any("error", err),
+					)
+				}
 				writeJSON(w, http.StatusUnauthorized, map[string]any{
 					"error": map[string]any{"code": "unauthorized", "message": "authentication required"},
 				})
 				return
+			}
+		} else {
+			if provider != nil && provider.logger != nil {
+				provider.logger.Debug("auth: RequireAuth authorized",
+					slog.String("path", r.URL.Path),
+					slog.String("subject", user.Subject),
+				)
 			}
 		}
 		ctx := context.WithValue(r.Context(), contextKey{}, user)
@@ -164,6 +196,7 @@ func ContextUser(ctx context.Context) (User, bool) {
 }
 
 func (p *Provider) handleConfig(w http.ResponseWriter, r *http.Request) {
+	p.logger.Debug("auth: handleConfig called", slog.String("provider_name", p.cfg.ProviderName))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"provider_name": p.cfg.ProviderName,
 		"login_url":     "/auth/login",
@@ -175,6 +208,7 @@ func (p *Provider) devUser() User {
 }
 
 func (p *Provider) setSessionCookie(w http.ResponseWriter, user User) {
+	p.logger.Debug("auth: setting session cookie", slog.String("user", user.Subject))
 	session, err := p.signSession(user)
 	if err != nil {
 		p.logger.Error("failed to sign user session", slog.Any("error", err))
@@ -185,6 +219,7 @@ func (p *Provider) setSessionCookie(w http.ResponseWriter, user User) {
 }
 
 func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
+	p.logger.Debug("auth: handleLogin called", slog.Bool("dev_mode", p.devMode))
 	if p.devMode {
 		p.setSessionCookie(w, p.devUser())
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -193,11 +228,13 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	state, err := randomToken()
 	if err != nil {
+		p.logger.Debug("auth: handleLogin failed to generate state token", slog.Any("error", err))
 		http.Error(w, "failed to create state", http.StatusInternalServerError)
 		return
 	}
 	nonce, err := randomToken()
 	if err != nil {
+		p.logger.Debug("auth: handleLogin failed to generate nonce token", slog.Any("error", err))
 		http.Error(w, "failed to create nonce", http.StatusInternalServerError)
 		return
 	}
@@ -207,10 +244,12 @@ func (p *Provider) handleLogin(w http.ResponseWriter, r *http.Request) {
 	setCookie(w, "oidc_nonce", nonce, 10*60, "/")
 
 	authURL := p.oauth2Config.AuthCodeURL(state, oauth2.SetAuthURLParam("nonce", nonce), oauth2.SetAuthURLParam("prompt", "login"))
+	p.logger.Debug("auth: redirecting to oidc authorization url", slog.String("auth_url", authURL))
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
+	p.logger.Debug("auth: handleCallback called", slog.Bool("dev_mode", p.devMode))
 	if p.devMode {
 		p.setSessionCookie(w, p.devUser())
 		http.Redirect(w, r, "/", http.StatusFound)
@@ -218,25 +257,30 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := r.ParseForm(); err != nil {
+		p.logger.Debug("auth: handleCallback form parse failed", slog.Any("error", err))
 		http.Error(w, "invalid callback", http.StatusBadRequest)
 		return
 	}
 	state := r.FormValue("state")
 	code := r.FormValue("code")
 	if state == "" || code == "" {
+		p.logger.Debug("auth: handleCallback missing state or code")
 		http.Error(w, "missing oauth state or code", http.StatusBadRequest)
 		return
 	}
 	stateCookie, err := r.Cookie("oidc_state")
 	if err != nil || stateCookie.Value != state {
+		p.logger.Debug("auth: handleCallback state cookie mismatch", slog.Any("error", err))
 		http.Error(w, "state validation failed", http.StatusBadRequest)
 		return
 	}
 	if _, err := r.Cookie("oidc_nonce"); err != nil {
+		p.logger.Debug("auth: handleCallback missing nonce cookie", slog.Any("error", err))
 		http.Error(w, "missing nonce state", http.StatusBadRequest)
 		return
 	}
 
+	p.logger.Debug("auth: exchanging oauth2 authorization code")
 	token, err := p.oauth2Config.Exchange(context.Background(), code)
 	if err != nil {
 		p.logger.Error("oidc token exchange failed", slog.Any("error", err))
@@ -246,10 +290,12 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	idToken, ok := token.Extra("id_token").(string)
 	if !ok || idToken == "" {
+		p.logger.Debug("auth: missing id_token in token exchange response")
 		http.Error(w, "missing id token", http.StatusUnauthorized)
 		return
 	}
 
+	p.logger.Debug("auth: verifying oidc ID token")
 	verified, err := p.verifier.Verify(context.Background(), idToken)
 	if err != nil {
 		p.logger.Error("oidc token verification failed", slog.Any("error", err))
@@ -269,7 +315,13 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := User{Subject: claims.Subject, Email: claims.Email, Name: claims.Name}
+	p.logger.Debug("auth: decoded claims successfully",
+		slog.String("sub", user.Subject),
+		slog.String("email", user.Email),
+		slog.String("name", user.Name),
+	)
 	if user.Subject == "" {
+		p.logger.Debug("auth: missing subject claim in oidc response")
 		http.Error(w, "missing subject claim", http.StatusUnauthorized)
 		return
 	}
@@ -284,15 +336,18 @@ func (p *Provider) handleCallback(w http.ResponseWriter, r *http.Request) {
 	setCookie(w, p.cfg.SessionCookie, session, int(p.cfg.SessionTTL.Seconds()), "/")
 	setCookie(w, "oidc_state", "", -1, "/")
 	setCookie(w, "oidc_nonce", "", -1, "/")
+	p.logger.Debug("auth: callback completed, session established for user", slog.String("sub", user.Subject))
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (p *Provider) handleLogout(w http.ResponseWriter, r *http.Request) {
+	p.logger.Debug("auth: handleLogout called, clearing session cookie")
 	setCookie(w, p.cfg.SessionCookie, "", -1, "/")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (p *Provider) signSession(user User) (string, error) {
+	p.logger.Debug("auth: signSession started", slog.String("subject", user.Subject))
 	claims := sessionClaims{
 		Sub:   user.Subject,
 		Email: user.Email,
@@ -301,18 +356,22 @@ func (p *Provider) signSession(user User) (string, error) {
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
+		p.logger.Debug("auth: signSession json marshal failed", slog.Any("error", err))
 		return "", err
 	}
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
 	sig := hmac.New(sha256.New, []byte(p.cfg.SessionSecret))
 	_, _ = sig.Write([]byte(payloadB64))
 	signature := base64.RawURLEncoding.EncodeToString(sig.Sum(nil))
+	p.logger.Debug("auth: signSession created session signature", slog.Int64("exp", claims.Exp))
 	return payloadB64 + "." + signature, nil
 }
 
 func (p *Provider) parseSession(raw string) (User, error) {
+	p.logger.Debug("auth: parseSession parsing session token")
 	parts := strings.Split(raw, ".")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		p.logger.Debug("auth: parseSession missing valid signature structure")
 		return User{}, errors.New("session is missing a valid signature")
 	}
 	payloadB64 := parts[0]
@@ -320,19 +379,24 @@ func (p *Provider) parseSession(raw string) (User, error) {
 	_, _ = sig.Write([]byte(payloadB64))
 	want := base64.RawURLEncoding.EncodeToString(sig.Sum(nil))
 	if !hmac.Equal([]byte(want), []byte(parts[1])) {
+		p.logger.Debug("auth: parseSession signature verification failed")
 		return User{}, errors.New("session signature is invalid")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
+		p.logger.Debug("auth: parseSession base64 decode failed", slog.Any("error", err))
 		return User{}, err
 	}
 	var claims sessionClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
+		p.logger.Debug("auth: parseSession unmarshal claims failed", slog.Any("error", err))
 		return User{}, err
 	}
 	if claims.Exp <= time.Now().Unix() {
+		p.logger.Debug("auth: parseSession token expired", slog.Int64("exp", claims.Exp), slog.Int64("now", time.Now().Unix()))
 		return User{}, errors.New("session expired")
 	}
+	p.logger.Debug("auth: parseSession successfully parsed user", slog.String("subject", claims.Sub))
 	return User{Subject: claims.Sub, Email: claims.Email, Name: claims.Name}, nil
 }
 

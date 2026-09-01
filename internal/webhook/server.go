@@ -96,7 +96,16 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	s.logger.Debug("webhook: incoming request",
+		slog.String("method", r.Method),
+		slog.String("remote_addr", r.RemoteAddr),
+		slog.Int64("content_length", r.ContentLength),
+		slog.String("github_event", r.Header.Get("X-GitHub-Event")),
+		slog.String("gitlab_event", r.Header.Get("X-Gitlab-Event")),
+	)
+
 	if r.Method != http.MethodPost {
+		s.logger.Debug("webhook: method not allowed", slog.String("method", r.Method))
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -109,6 +118,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No matching webhook provider", http.StatusBadRequest)
 		return
 	}
+	s.logger.Debug("webhook: matched provider", slog.String("provider", provider.Name()))
 
 	// Limit request body size
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
@@ -130,6 +140,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+	s.logger.Debug("webhook: read payload bytes", slog.Int("bytes_read", len(body)))
 
 	// Parse payload first so we can match the repository and verify the request against
 	// the repository-specific secret instead of a global fallback secret map.
@@ -143,25 +154,44 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Debug("webhook: parsed repository info",
+		slog.String("provider", repoInfo.Provider),
+		slog.String("full_name", repoInfo.FullName),
+		slog.String("owner", repoInfo.Owner),
+		slog.String("name", repoInfo.Name),
+		slog.String("ref", repoInfo.Ref),
+		slog.String("before", repoInfo.Before),
+		slog.String("after", repoInfo.After),
+		slog.String("clone_url", repoInfo.CloneURL),
+		slog.String("ssh_url", repoInfo.SSHURL),
+	)
+
 	matchURL := repoInfo.CloneURL
 	if matchURL == "" {
 		matchURL = repoInfo.SSHURL
 	}
 	if matchURL != "" {
+		rawMatchURL := matchURL
 		matchURL, err = giturl.NormalizeToSSH(matchURL, "git")
 		if err != nil {
 			s.logger.Warn("failed to normalize repository URL for lookup",
 				slog.String("provider", provider.Name()),
 				slog.String("repo", repoInfo.FullName),
+				slog.String("raw_url", rawMatchURL),
 				slog.Any("error", err),
 			)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.logger.Debug("webhook: normalized URL for lookup",
+			slog.String("raw_url", rawMatchURL),
+			slog.String("normalized_url", matchURL),
+		)
 	}
 
 	matchedRepo := (*store.Repository)(nil)
 	if s.repoStore != nil {
+		s.logger.Debug("webhook: querying store for matching repositories", slog.String("url", matchURL))
 		repos, err := s.repoStore.ListByPullURL(r.Context(), matchURL)
 		if err != nil {
 			s.logger.Warn("failed to lookup matching repositories",
@@ -172,17 +202,40 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.logger.Debug("webhook: found candidate repositories", slog.Int("count", len(repos)))
 		for i := range repos {
 			repo := &repos[i]
+			s.logger.Debug("webhook: evaluating candidate repository",
+				slog.Int64("repo_id", repo.ID),
+				slog.String("repo_name", repo.Name),
+				slog.Bool("enabled", repo.Enabled),
+				slog.String("provider_hint", repo.ProviderHint),
+			)
 			if !repo.Enabled {
+				s.logger.Debug("webhook: candidate is disabled", slog.Int64("repo_id", repo.ID))
 				continue
 			}
 			if repo.ProviderHint != "" && repo.ProviderHint != provider.Name() {
+				s.logger.Debug("webhook: candidate provider hint mismatch",
+					slog.Int64("repo_id", repo.ID),
+					slog.String("provider_hint", repo.ProviderHint),
+					slog.String("actual_provider", provider.Name()),
+				)
 				continue
 			}
 			if err := verifyRepoSignature(provider, repo, r.Header, body); err == nil {
+				s.logger.Debug("webhook: signature verification succeeded for repository",
+					slog.Int64("repo_id", repo.ID),
+					slog.String("repo_name", repo.Name),
+				)
 				matchedRepo = repo
 				break
+			} else {
+				s.logger.Debug("webhook: signature verification failed for repository",
+					slog.Int64("repo_id", repo.ID),
+					slog.String("repo_name", repo.Name),
+					slog.Any("error", err),
+				)
 			}
 		}
 	}
@@ -220,10 +273,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		eventID = id
+		s.logger.Debug("webhook: inserted received sync event", slog.Int64("event_id", eventID))
 	}
 
 	// Enqueue background job
 	if s.enqueuer != nil {
+		s.logger.Debug("webhook: enqueuing sync job to worker pool",
+			slog.Int64("event_id", eventID),
+			slog.String("repo", repoInfo.FullName),
+		)
 		if err := s.enqueuer.Enqueue(r.Context(), *repoInfo, eventID); err != nil {
 			s.logger.Error("failed to enqueue sync job",
 				slog.String("repo", repoInfo.FullName),
@@ -233,6 +291,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to enqueue sync job", http.StatusInternalServerError)
 			return
 		}
+		s.logger.Debug("webhook: enqueued sync job successfully", slog.Int64("event_id", eventID))
 	}
 
 	s.logger.Info("webhook received and enqueued",
