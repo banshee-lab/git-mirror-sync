@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -157,6 +158,21 @@ func TestPoolConcurrencyDifferentRepos(t *testing.T) {
 
 	if atomic.LoadInt32(&maxInFlight) != 2 {
 		t.Errorf("expected max 2 in-flight for different repos, got %d", maxInFlight)
+	}
+}
+
+func TestResolveKeyPathUsesSSHKeysDirForRelativePaths(t *testing.T) {
+	keysDir := "/var/cache/forgejo-sync/keys"
+	private := "id_Key1_T6Y-UK3-pog"
+
+	got := resolveKeyPath(keysDir, private)
+	want := filepath.Join(keysDir, private)
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+
+	if got := resolveKeyPath(keysDir, "/already/absolute/id_rsa"); got != "/already/absolute/id_rsa" {
+		t.Fatalf("expected absolute path preserved, got %q", got)
 	}
 }
 

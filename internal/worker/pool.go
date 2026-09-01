@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -200,6 +201,19 @@ func (p *Pool) pruner() {
 	}
 }
 
+func resolveKeyPath(keysDir, privatePath string) string {
+	if privatePath == "" {
+		return ""
+	}
+	if filepath.IsAbs(privatePath) {
+		return privatePath
+	}
+	if keysDir == "" {
+		return privatePath
+	}
+	return filepath.Join(keysDir, privatePath)
+}
+
 func (p *Pool) processJob(job syncJob) {
 	status := history.StatusError
 	detail := ""
@@ -371,16 +385,19 @@ func (p *Pool) processJob(job syncJob) {
 		return
 	}
 
+	pullKeyPath := resolveKeyPath(p.cfg.SSHKeysDir, pullKey.PrivatePath)
+	pushKeyPath := resolveKeyPath(p.cfg.SSHKeysDir, pushKey.PrivatePath)
+
 	slog.Debug("resolved repository keys",
 		slog.Int64("repoID", matchedRepo.ID),
-		slog.String("pull_key_file", pullKey.PrivatePath),
-		slog.String("push_key_file", pushKey.PrivatePath),
+		slog.String("pull_key_file", pullKeyPath),
+		slog.String("push_key_file", pushKeyPath),
 	)
 
 	syncOpts := gitsync.SyncOptions{
 		CacheDir:      p.cfg.CacheDir,
 		SourceURL:     matchedRepo.PullURLSSH,
-		SourceKeyPath: pullKey.PrivatePath,
+		SourceKeyPath: pullKeyPath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
 	slog.Debug("executing SyncRepository in worker", slog.Int64("eventID", job.eventID), slog.String("source_url", syncOpts.SourceURL))
@@ -396,7 +413,7 @@ func (p *Pool) processJob(job syncJob) {
 	pushOpts := gitsync.PushOptions{
 		CachePath:     cachePath,
 		RemoteURL:     matchedRepo.PushURLSSH,
-		RemoteKeyPath: pushKey.PrivatePath,
+		RemoteKeyPath: pushKeyPath,
 		Timeout:       p.cfg.GitCommandTimeout,
 	}
 	slog.Debug("executing PushToRemote in worker", slog.Int64("eventID", job.eventID), slog.String("remote_url", pushOpts.RemoteURL))
