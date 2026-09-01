@@ -17,7 +17,7 @@ type Repository struct {
 	PushURLRaw     string    `json:"push_url_raw"`
 	PushURLSSH     string    `json:"push_url_ssh"`
 	PushSSHKeyID   int64     `json:"push_ssh_key_id"`
-	WebhookSecHash string    `json:"-"` // bcrypt hash of the webhook secret (not stored plaintext)
+	WebhookSecHash string    `json:"-"` // AES-GCM encrypted webhook secret; reversible for signature verification
 	ProviderHint     string     `json:"provider_hint"` // "github" | "gitlab" | "forgejo" | "gitea" | "generic", for signature verification
 	PushProviderHint string     `json:"push_provider_hint"`
 	Enabled          bool       `json:"enabled"`

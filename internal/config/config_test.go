@@ -21,6 +21,7 @@ func validEnvMap() map[string]string {
 		"OIDC_CLIENT_SECRET": "client_secret",
 		"OIDC_REDIRECT_URL":  "https://sync.example.com/auth/callback",
 		"SESSION_SECRET":     "session_secret_32_bytes_minimum",
+		"SECRET_KEY":         "development-secret-key-change-me",
 	}
 }
 
@@ -119,6 +120,7 @@ func TestConfig_Load_DevelopmentMode(t *testing.T) {
 	delete(env, "OIDC_CLIENT_SECRET")
 	delete(env, "OIDC_REDIRECT_URL")
 	delete(env, "SESSION_SECRET")
+	delete(env, "SECRET_KEY")
 
 	cfg, err := config.LoadFrom(func(k string) string { return env[k] })
 	if err != nil {
@@ -132,6 +134,9 @@ func TestConfig_Load_DevelopmentMode(t *testing.T) {
 	}
 	if cfg.SessionSecret != "development-session-secret-change-me" {
 		t.Fatalf("expected dev session secret default, got %q", cfg.SessionSecret)
+	}
+	if cfg.SecretKey != "development-secret-key-change-me" {
+		t.Fatalf("expected dev secret key default, got %q", cfg.SecretKey)
 	}
 }
 
@@ -154,6 +159,7 @@ func TestConfig_Load_MissingRequired_MultiError(t *testing.T) {
 		"OIDC_CLIENT_SECRET",
 		"OIDC_REDIRECT_URL",
 		"SESSION_SECRET",
+		"SECRET_KEY",
 	}
 
 	errStr := err.Error()

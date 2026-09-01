@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/reposvc"
 	"forgejo-sync/internal/store"
 	"forgejo-sync/internal/webhook"
 )
@@ -113,14 +115,25 @@ const sampleGitLabPayload = `{
 }`
 
 func setupTestServer() (*webhook.Server, *mockHistoryWriter, *mockJobEnqueuer) {
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-32-chars-minimum")
+
+	ghEncrypted, err := reposvc.EncryptSecret(testGitHubSecret)
+	if err != nil {
+		panic(err)
+	}
+	glEncrypted, err := reposvc.EncryptSecret(testGitLabSecret)
+	if err != nil {
+		panic(err)
+	}
+
 	hist := &mockHistoryWriter{}
 	enq := &mockJobEnqueuer{}
 	repoStore := &fakeRepoStore{lookupFunc: func(normalizedPullURL string) ([]store.Repository, error) {
 		switch normalizedPullURL {
 		case "ssh://git@github.com/octocat/hello-world.git":
-			return []store.Repository{{ID: 1, Name: "octocat/hello-world", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "github", WebhookSecHash: testGitHubSecret}}, nil
+			return []store.Repository{{ID: 1, Name: "octocat/hello-world", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "github", WebhookSecHash: ghEncrypted}}, nil
 		case "ssh://git@example.com/mike/diaspora.git":
-			return []store.Repository{{ID: 2, Name: "mike/diaspora", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "gitlab", WebhookSecHash: testGitLabSecret}}, nil
+			return []store.Repository{{ID: 2, Name: "mike/diaspora", Enabled: true, PullURLSSH: normalizedPullURL, ProviderHint: "gitlab", WebhookSecHash: glEncrypted}}, nil
 		default:
 			return nil, nil
 		}

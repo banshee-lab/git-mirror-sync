@@ -30,6 +30,7 @@ type Config struct {
 	OIDCScopes        string
 	OIDCProviderName  string
 	SessionSecret     string
+	SecretKey         string
 	SessionCookieName string
 	SessionTTL        time.Duration
 
@@ -105,6 +106,10 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		cfg.OIDCScopes = getOptional("OIDC_SCOPES", "openid profile email")
 		cfg.OIDCProviderName = getOptional("OIDC_PROVIDER_NAME", "Development")
 		cfg.SessionSecret = getOptional("SESSION_SECRET", "development-session-secret-change-me")
+		cfg.SecretKey = getOptional("SECRET_KEY", "development-secret-key-change-me")
+		if len(cfg.SecretKey) < 16 {
+			errs = append(errs, errors.New("SECRET_KEY must be at least 16 characters in development mode"))
+		}
 		cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
 		cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
 	} else {
@@ -118,6 +123,10 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		cfg.SessionSecret = getRequired("SESSION_SECRET")
 		if len(cfg.SessionSecret) < 16 {
 			errs = append(errs, errors.New("SESSION_SECRET must be at least 16 characters in production mode"))
+		}
+		cfg.SecretKey = getRequired("SECRET_KEY")
+		if len(cfg.SecretKey) < 32 {
+			errs = append(errs, errors.New("SECRET_KEY must be at least 32 characters in production mode"))
 		}
 		cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
 		cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)

@@ -14,14 +14,31 @@ A Go service for mirroring repository activity into a Git target over SSH, with 
 ## Architecture
 
 - `cmd/forgejo-sync` wires the app together as a single HTTP server.
+- `internal/config` validates and loads environment variables for v2 settings.
 - `internal/store` owns the SQLite schema for `repositories`, `ssh_keys`, and `sync_events`.
 - `internal/giturl` normalizes source and target URLs to the SSH form used by git.
+- `internal/gitsync` orchestrates repository clone/fetch and push operations.
 - `internal/reposvc` handles repository CRUD plus optional `sync_now` actions.
 - `internal/sshkeys` generates and manages SSH key pairs on disk.
 - `internal/worker` handles async sync jobs with per-repository locking.
 - `internal/webhook` verifies provider signatures against the repository's configured secret.
 - `internal/auth` provides OIDC login/session handling.
+- `internal/api` exposes protected REST endpoints.
 - `internal/webapp` embeds the Angular frontend build into the Go binary.
+- `internal/events` tracks and manages sync event history.
+- `internal/dashboard` provides dashboard functionality for monitoring and management.
+
+## Frontend
+
+The Angular frontend is located in the `frontend/` directory and is embedded at build time into the Go binary. It is served by `internal/webapp` and communicates with the backend through protected REST endpoints under `/api/*`.
+
+## Data Model
+
+The SQLite database (`APP_DB_PATH`) stores three main entities:
+
+- **repositories** — Configured source and target URLs, webhook secrets, and SSH key references.
+- **ssh_keys** — Per-repository SSH key references pointing to disk-managed key files.
+- **sync_events** — Historical records of sync outcomes, push results, and errors.
 
 ## Required environment
 
@@ -43,6 +60,7 @@ OIDC_REDIRECT_URL=http://localhost:8080/auth/callback
 OIDC_SCOPES=openid profile email
 OIDC_PROVIDER_NAME=PocketID
 SESSION_SECRET=replace-with-a-32-byte-random-secret
+SECRET_KEY=replace-with-a-32-byte-random-secret-used-for-webhook-encryption
 SESSION_COOKIE_NAME=forgejo_sync_session
 SESSION_TTL=24h
 ```

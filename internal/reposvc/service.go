@@ -2,12 +2,16 @@ package reposvc
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -164,6 +168,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (store.Reposito
 		return store.Repository{}, fmt.Errorf("repository %q already exists", req.Name)
 	}
 
+	encryptedSecret, err := encryptSecret(req.WebhookSecret)
+	if err != nil {
+		s.logger.Debug("reposvc.Create failed: encrypt webhook secret", slog.Any("error", err))
+		return store.Repository{}, fmt.Errorf("failed to encrypt webhook secret: %w", err)
+	}
+
 	repo := store.Repository{
 		Name:             req.Name,
 		PullURLRaw:       req.PullURL,
@@ -172,7 +182,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (store.Reposito
 		PushURLRaw:       req.PushURL,
 		PushURLSSH:       pushSSH,
 		PushSSHKeyID:     req.PushSSHKeyID,
-		WebhookSecHash:   hashSecret(req.WebhookSecret),
+		WebhookSecHash:   encryptedSecret,
 		ProviderHint:     inferProvider(req.PullURL),
 		PushProviderHint: inferProvider(req.PushURL),
 		Enabled:          true,
@@ -296,10 +306,6 @@ func (s *Service) Update(ctx context.Context, id int64, req UpdateRequest) (stor
 	if req.PushSSHKeyID == 0 {
 		req.PushSSHKeyID = existing.PushSSHKeyID
 	}
-	if req.WebhookSecret == "" {
-		req.WebhookSecret = existing.WebhookSecHash
-	}
-
 	if _, err := s.keys.Get(ctx, req.PullSSHKeyID); err != nil {
 		s.logger.Debug("reposvc.Update failed: pull SSH key not found", slog.Int64("pull_ssh_key_id", req.PullSSHKeyID), slog.Any("error", err))
 		return store.Repository{}, fmt.Errorf("pull SSH key not found: %w", err)
@@ -334,8 +340,13 @@ func (s *Service) Update(ctx context.Context, id int64, req UpdateRequest) (stor
 	existing.PushURLRaw = req.PushURL
 	existing.PushURLSSH = pushSSH
 	existing.PushSSHKeyID = req.PushSSHKeyID
-	if req.WebhookSecret != existing.WebhookSecHash {
-		existing.WebhookSecHash = hashSecret(req.WebhookSecret)
+	if req.WebhookSecret != "" {
+		encryptedSecret, err := encryptSecret(req.WebhookSecret)
+		if err != nil {
+			s.logger.Debug("reposvc.Update failed: encrypt webhook secret", slog.Any("error", err))
+			return store.Repository{}, fmt.Errorf("failed to encrypt webhook secret: %w", err)
+		}
+		existing.WebhookSecHash = encryptedSecret
 	}
 	existing.ProviderHint = inferProvider(req.PullURL)
 	existing.PushProviderHint = inferProvider(req.PushURL)
@@ -666,9 +677,73 @@ func inferProvider(rawURL string) string {
 	return "generic"
 }
 
-func hashSecret(secret string) string {
+func getWebhookSecretKey() ([]byte, error) {
+	secret := strings.TrimSpace(os.Getenv("SECRET_KEY"))
+	if secret == "" {
+		secret = "development-secret-key-change-me"
+	}
 	sum := sha256.Sum256([]byte(secret))
-	return hex.EncodeToString(sum[:])
+	return sum[:], nil
+}
+
+func EncryptSecret(secret string) (string, error) {
+	if strings.TrimSpace(secret) == "" {
+		return "", nil
+	}
+	key, err := getWebhookSecretKey()
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate nonce: %w", err)
+	}
+	ciphertext := gcm.Seal(nonce, nonce, []byte(secret), nil)
+	return hex.EncodeToString(ciphertext), nil
+}
+
+func DecryptSecret(secret string) (string, error) {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return "", nil
+	}
+	key, err := getWebhookSecretKey()
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+	ciphertext, err := hex.DecodeString(secret)
+	if err != nil {
+		return "", fmt.Errorf("decode encrypted secret: %w", err)
+	}
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", errors.New("encrypted secret is too short")
+	}
+	nonce, payload := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, payload, nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt webhook secret: %w", err)
+	}
+	return string(plaintext), nil
+}
+
+func encryptSecret(secret string) (string, error) {
+	return EncryptSecret(secret)
 }
 
 // TestConnectionRequest is the input for testing repository connections.

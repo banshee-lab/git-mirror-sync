@@ -7,13 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 
 	"forgejo-sync/internal/giturl"
 	"forgejo-sync/internal/history"
+	"forgejo-sync/internal/reposvc"
 	"forgejo-sync/internal/store"
 )
 
@@ -307,26 +305,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func verifyRepoSignature(provider Provider, repo *store.Repository, h http.Header, body []byte) error {
 	if repo == nil || repo.WebhookSecHash == "" {
-		return errors.New("repository secret hash missing")
+		return errors.New("repository secret missing")
 	}
 
-	if err := provider.VerifySignature(repo.WebhookSecHash, h, body); err == nil {
+	secret, err := reposvc.DecryptSecret(repo.WebhookSecHash)
+	if err != nil {
+		return fmt.Errorf("decrypt repository secret: %w", err)
+	}
+	if err := provider.VerifySignature(secret, h, body); err == nil {
 		return nil
-	}
-
-	if strings.HasPrefix(repo.WebhookSecHash, "$2") {
-		candidate := ""
-		switch provider.Name() {
-		case "gitlab":
-			candidate = h.Get("X-Gitlab-Token")
-		case "github":
-			candidate = h.Get("X-Hub-Signature-256")
-		}
-		if candidate != "" {
-			if err := bcrypt.CompareHashAndPassword([]byte(repo.WebhookSecHash), []byte(candidate)); err == nil {
-				return nil
-			}
-		}
 	}
 
 	return errors.New("repository secret verification failed")

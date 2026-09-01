@@ -16,6 +16,7 @@ This repository is currently in the v2 architecture:
 - `internal/config` — env validation for v2 settings
 - `internal/store` — SQLite-backed repository/key/history models
 - `internal/giturl` — SSH normalization for source and target git URLs
+- `internal/gitsync` — repository clone/fetch and push operations
 - `internal/sshkeys` — SSH key generation and file management
 - `internal/reposvc` — repository CRUD and sync-now orchestration
 - `internal/worker` — async sync jobs with per-repository locking
@@ -23,6 +24,8 @@ This repository is currently in the v2 architecture:
 - `internal/auth` — OIDC login, callback, session cookie, RequireAuth middleware
 - `internal/api` — protected REST endpoints
 - `internal/webapp` — embedded frontend asset serving
+- `internal/events` — sync event tracking and history management
+- `internal/dashboard` — dashboard functionality for monitoring and management
 
 ## Runtime expectations
 

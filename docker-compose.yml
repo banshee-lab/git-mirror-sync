@@ -10,6 +10,7 @@ services:
       SSH_KEYS_DIR: /var/cache/forgejo-sync/keys
       MODE: development
       LOG_LEVEL: debug
+      SECRET_KEY: 3MF6V91k1dqv1yolPHc8HxroF92Zx4ljEk9rEnGaMS0Ak44WevEJXNKelPWlvb4C
     volumes:
       - cache_data:/var/cache/forgejo-sync
     healthcheck:

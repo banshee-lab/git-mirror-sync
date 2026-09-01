@@ -272,6 +272,30 @@ func TestServiceCreateNormalizesURLsAndValidatesKeys(t *testing.T) {
 	}
 }
 
+func TestServiceEncryptsWebhookSecretWithAESGCM(t *testing.T) {
+	t.Setenv("SECRET_KEY", "development-secret-key-change-me")
+
+	secret := "super-secret"
+	encrypted, err := EncryptSecret(secret)
+	if err != nil {
+		t.Fatalf("EncryptSecret() returned error: %v", err)
+	}
+	if encrypted == secret {
+		t.Fatal("encrypted secret matched plaintext")
+	}
+	if encrypted == "" {
+		t.Fatal("encrypted secret should not be empty")
+	}
+
+	decrypted, err := DecryptSecret(encrypted)
+	if err != nil {
+		t.Fatalf("DecryptSecret() returned error: %v", err)
+	}
+	if decrypted != secret {
+		t.Fatalf("expected decrypted secret %q, got %q", secret, decrypted)
+	}
+}
+
 func TestServiceCreateRejectsInvalidURL(t *testing.T) {
 	ctx := context.Background()
 	repoStore := newFakeRepoStore()
