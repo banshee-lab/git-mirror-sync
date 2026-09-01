@@ -15,6 +15,7 @@ import (
 	"forgejo-sync/internal/api"
 	"forgejo-sync/internal/auth"
 	"forgejo-sync/internal/config"
+	"forgejo-sync/internal/events"
 	"forgejo-sync/internal/gitsync"
 	"forgejo-sync/internal/reposvc"
 	"forgejo-sync/internal/sshkeys"
@@ -132,8 +133,9 @@ func run() error {
 	}
 	logger.Debug("ensured SSH keys directory exists", slog.String("dir", cfg.SSHKeysDir))
 
+	eventHub := events.NewHub()
 	keyManager := sshkeys.NewManager(cfg.SSHKeysDir, keyStore, repoStore, logger)
-	repoSvc := reposvc.NewService(repoStore, keyStore, appDB.SyncEvents(), gitSyncer{}, cfg.SSHKeysDir, cfg.CacheDir, logger)
+	repoSvc := reposvc.NewService(repoStore, keyStore, appDB.SyncEvents(), gitSyncer{}, cfg.SSHKeysDir, cfg.CacheDir, eventHub, logger)
 
 	logger.Debug("initializing auth provider",
 		slog.String("mode", cfg.Mode),
@@ -161,6 +163,7 @@ func run() error {
 	// Initialize the worker pool and webhook server against the same app DB.
 	eventStore := appDB.SyncEvents()
 	workerPool := worker.New(cfg, repoStore, keyStore, eventStore)
+	workerPool.SetHub(eventHub)
 	workerPool.Start()
 	logger.Debug("worker pool started", slog.Int("concurrency", cfg.WorkerConcurrency))
 
@@ -179,6 +182,7 @@ func run() error {
 		RepoSvc:    repoSvc,
 		KeyMgr:     keyManager,
 		Auth:       authProvider,
+		Hub:        eventHub,
 		Logger:     logger,
 	})
 

@@ -9,6 +9,7 @@ type Status string
 
 const (
 	StatusReceived Status = "received"
+	StatusRunning  Status = "running"
 	StatusSkipped  Status = "skipped"
 	StatusSuccess  Status = "success"
 	StatusConflict Status = "conflict"
@@ -18,7 +19,7 @@ const (
 // IsValid checks if the status is one of the allowed values.
 func (s Status) IsValid() bool {
 	switch s {
-	case StatusReceived, StatusSkipped, StatusSuccess, StatusConflict, StatusError:
+	case StatusReceived, StatusRunning, StatusSkipped, StatusSuccess, StatusConflict, StatusError:
 		return true
 	default:
 		return false

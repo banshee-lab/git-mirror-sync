@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"forgejo-sync/internal/events"
 	"forgejo-sync/internal/giturl"
 	"forgejo-sync/internal/gitsync"
+	"forgejo-sync/internal/history"
 	"forgejo-sync/internal/store"
 )
 
@@ -27,25 +30,39 @@ type GitSyncer interface {
 // EventRecorder stores sync history entries.
 type EventRecorder interface {
 	Create(ctx context.Context, event store.SyncEvent) (store.SyncEvent, error)
+	Finish(ctx context.Context, id int64, status history.Status, detail string, commitAfter string, finishedAt time.Time) error
 }
 
 // Service orchestrates repository CRUD and sync execution based on local SQLite-backed stores.
 type Service struct {
-	repos    store.RepositoryStore
-	keys     store.SSHKeyStore
-	events   EventRecorder
-	git      GitSyncer
-	keysDir  string
-	cacheDir string
-	logger   *slog.Logger
+	repos       store.RepositoryStore
+	keys        store.SSHKeyStore
+	events      EventRecorder
+	git         GitSyncer
+	keysDir     string
+	cacheDir    string
+	hub         *events.Hub
+	repoLocks   map[int64]*sync.Mutex
+	repoLocksMu sync.Mutex
+	logger      *slog.Logger
 }
 
 // NewService creates a repository service with the provided dependencies.
-func NewService(repos store.RepositoryStore, keys store.SSHKeyStore, events EventRecorder, git GitSyncer, keysDir, cacheDir string, logger *slog.Logger) *Service {
+func NewService(repos store.RepositoryStore, keys store.SSHKeyStore, events EventRecorder, git GitSyncer, keysDir, cacheDir string, hub *events.Hub, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Service{repos: repos, keys: keys, events: events, git: git, keysDir: keysDir, cacheDir: cacheDir, logger: logger}
+	return &Service{
+		repos:     repos,
+		keys:      keys,
+		events:    events,
+		git:       git,
+		keysDir:   keysDir,
+		cacheDir:  cacheDir,
+		hub:       hub,
+		repoLocks: make(map[int64]*sync.Mutex),
+		logger:    logger,
+	}
 }
 
 // ListRequest is the input parameters for listing repositories.
@@ -348,9 +365,176 @@ func (s *Service) Update(ctx context.Context, id int64, req UpdateRequest) (stor
 	return updated, nil
 }
 
-// SyncNow performs a pull+push sync for the repository and records a sync event.
+func (s *Service) getRepoLock(repoID int64) *sync.Mutex {
+	s.repoLocksMu.Lock()
+	defer s.repoLocksMu.Unlock()
+	mu, ok := s.repoLocks[repoID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.repoLocks[repoID] = mu
+	}
+	return mu
+}
+
+// SyncNowAsync creates an initial "running" sync event and executes the sync asynchronously in the background.
+func (s *Service) SyncNowAsync(ctx context.Context, repoID int64) (int64, error) {
+	s.logger.Debug("reposvc.SyncNowAsync started", slog.Int64("repo_id", repoID))
+
+	repo, err := s.repos.Get(ctx, repoID)
+	if err != nil {
+		s.logger.Debug("reposvc.SyncNowAsync failed to find repo", slog.Int64("repo_id", repoID), slog.Any("error", err))
+		return 0, err
+	}
+
+	if _, err := s.keys.Get(ctx, repo.PullSSHKeyID); err != nil {
+		s.logger.Debug("reposvc.SyncNowAsync pull key not found", slog.Int64("pull_ssh_key_id", repo.PullSSHKeyID), slog.Any("error", err))
+		return 0, fmt.Errorf("pull key not found: %w", err)
+	}
+	if _, err := s.keys.Get(ctx, repo.PushSSHKeyID); err != nil {
+		s.logger.Debug("reposvc.SyncNowAsync push key not found", slog.Int64("push_ssh_key_id", repo.PushSSHKeyID), slog.Any("error", err))
+		return 0, fmt.Errorf("push key not found: %w", err)
+	}
+
+	now := time.Now().UTC()
+	initialEvent := store.SyncEvent{
+		ReceivedAt:   now,
+		FinishedAt:   now,
+		Provider:     repo.ProviderHint,
+		RepoFullName: repo.Name,
+		CloneURL:     repo.PullURLRaw,
+		SSHURL:       repo.PullURLSSH,
+		Ref:          "refs/heads/*",
+		Status:       string(history.StatusRunning),
+		Detail:       "sync in progress",
+	}
+
+	created, err := s.events.Create(ctx, initialEvent)
+	if err != nil {
+		s.logger.Debug("reposvc.SyncNowAsync failed to record initial sync event", slog.Int64("repo_id", repoID), slog.Any("error", err))
+		return 0, fmt.Errorf("failed to record initial sync event: %w", err)
+	}
+
+	if s.hub != nil {
+		s.hub.Publish(events.SyncEventPayload{
+			Type:      events.TypeSyncStarted,
+			EventID:   created.ID,
+			RepoID:    repo.ID,
+			RepoName:  repo.Name,
+			Status:    string(history.StatusRunning),
+			Detail:    "sync in progress",
+			Timestamp: now,
+		})
+	}
+
+	go s.executeSync(created.ID, repo)
+
+	s.logger.Debug("reposvc.SyncNowAsync enqueued sync job",
+		slog.Int64("repo_id", repoID),
+		slog.Int64("event_id", created.ID),
+	)
+	return created.ID, nil
+}
+
+func (s *Service) executeSync(eventID int64, repo store.Repository) {
+	mu := s.getRepoLock(repo.ID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	start := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	pullKey, err := s.keys.Get(ctx, repo.PullSSHKeyID)
+	if err != nil {
+		s.finishSync(eventID, repo, history.StatusError, fmt.Sprintf("Pull key not found: %v", err), "", start)
+		return
+	}
+	pushKey, err := s.keys.Get(ctx, repo.PushSSHKeyID)
+	if err != nil {
+		s.finishSync(eventID, repo, history.StatusError, fmt.Sprintf("Push key not found: %v", err), "", start)
+		return
+	}
+
+	pullKeyPath := filepath.Join(s.keysDir, pullKey.PrivatePath)
+	pushKeyPath := filepath.Join(s.keysDir, pushKey.PrivatePath)
+
+	cachePath, err := gitsync.GetCachePath(s.cacheDir, repo.PullURLSSH)
+	if err != nil {
+		s.finishSync(eventID, repo, history.StatusError, fmt.Sprintf("Failed to resolve cache path: %v", err), "", start)
+		return
+	}
+
+	_, err = s.git.SyncRepository(ctx, gitsync.SyncOptions{
+		CacheDir:      s.cacheDir,
+		SourceURL:     repo.PullURLSSH,
+		SourceKeyPath: pullKeyPath,
+		Timeout:       10 * time.Minute,
+	})
+	if err != nil {
+		s.finishSync(eventID, repo, history.StatusError, fmt.Sprintf("Pull sync failed: %v", err), "", start)
+		return
+	}
+
+	pushResult, err := s.git.PushToRemote(ctx, gitsync.PushOptions{
+		CachePath:     cachePath,
+		RemoteURL:     repo.PushURLSSH,
+		RemoteKeyPath: pushKeyPath,
+		Timeout:       10 * time.Minute,
+	})
+	if err != nil {
+		var conflictErr *gitsync.ErrConflict
+		if errors.As(err, &conflictErr) {
+			s.finishSync(eventID, repo, history.StatusConflict, conflictErr.Detail, "", start)
+		} else {
+			s.finishSync(eventID, repo, history.StatusError, fmt.Sprintf("Push sync failed: %v", err), "", start)
+		}
+		return
+	}
+
+	detail := "sync completed"
+	if pushResult != nil && pushResult.RawOutput != "" {
+		detail = pushResult.RawOutput
+	}
+	commitAfter := ""
+	if pushResult != nil && pushResult.AfterSHA != "" {
+		commitAfter = pushResult.AfterSHA
+	}
+	s.finishSync(eventID, repo, history.StatusSuccess, detail, commitAfter, start)
+}
+
+func (s *Service) finishSync(eventID int64, repo store.Repository, status history.Status, detail string, commitAfter string, start time.Time) {
+	finishedAt := time.Now().UTC()
+	durationMS := finishedAt.Sub(start).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+
+	if err := s.events.Finish(context.Background(), eventID, status, detail, commitAfter, finishedAt); err != nil {
+		s.logger.Error("reposvc: failed to finish sync event", slog.Int64("event_id", eventID), slog.Any("error", err))
+	}
+
+	eventType := events.TypeSyncCompleted
+	if status == history.StatusError || status == history.StatusConflict {
+		eventType = events.TypeSyncFailed
+	}
+
+	if s.hub != nil {
+		s.hub.Publish(events.SyncEventPayload{
+			Type:       eventType,
+			EventID:    eventID,
+			RepoID:     repo.ID,
+			RepoName:   repo.Name,
+			Status:     string(status),
+			Detail:     detail,
+			DurationMS: durationMS,
+			Timestamp:  finishedAt,
+		})
+	}
+}
+
+// SyncNow performs a pull+push sync for the repository synchronously and records a sync event.
 func (s *Service) SyncNow(ctx context.Context, repoID int64) (int64, error) {
-	start := time.Now()
+	start := time.Now().UTC()
 	s.logger.Debug("reposvc.SyncNow started", slog.Int64("repo_id", repoID))
 
 	repo, err := s.repos.Get(ctx, repoID)
@@ -404,7 +588,7 @@ func (s *Service) SyncNow(ctx context.Context, repoID int64) (int64, error) {
 		slog.String("push_key_path", pushKeyPath),
 	)
 
-	_, err = s.git.PushToRemote(ctx, gitsync.PushOptions{
+	pushResult, err := s.git.PushToRemote(ctx, gitsync.PushOptions{
 		CachePath:     cachePath,
 		RemoteURL:     repo.PushURLSSH,
 		RemoteKeyPath: pushKeyPath,
@@ -415,24 +599,46 @@ func (s *Service) SyncNow(ctx context.Context, repoID int64) (int64, error) {
 		return 0, fmt.Errorf("push sync failed: %w", err)
 	}
 
+	detail := "sync completed"
+	if pushResult != nil && pushResult.RawOutput != "" {
+		detail = pushResult.RawOutput
+	}
+	commitAfter := ""
+	if pushResult != nil && pushResult.AfterSHA != "" {
+		commitAfter = pushResult.AfterSHA
+	}
+
 	event := store.SyncEvent{
 		ReceivedAt:   start,
-		FinishedAt:   time.Now(),
+		FinishedAt:   time.Now().UTC(),
 		Provider:     repo.ProviderHint,
 		RepoFullName: repo.Name,
 		CloneURL:     repo.PullURLRaw,
 		SSHURL:       repo.PullURLSSH,
 		Ref:          "refs/heads/*",
 		CommitBefore: "",
-		CommitAfter:  "",
-		Status:       "success",
-		Detail:       "sync completed",
+		CommitAfter:  commitAfter,
+		Status:       string(history.StatusSuccess),
+		Detail:       detail,
 		DurationMS:   time.Since(start).Milliseconds(),
 	}
 	created, err := s.events.Create(ctx, event)
 	if err != nil {
 		s.logger.Debug("reposvc.SyncNow failed to record sync event", slog.Int64("repo_id", repoID), slog.Any("error", err))
 		return 0, fmt.Errorf("failed to record sync event: %w", err)
+	}
+
+	if s.hub != nil {
+		s.hub.Publish(events.SyncEventPayload{
+			Type:       events.TypeSyncCompleted,
+			EventID:    created.ID,
+			RepoID:     repo.ID,
+			RepoName:   repo.Name,
+			Status:     string(history.StatusSuccess),
+			Detail:     detail,
+			DurationMS: event.DurationMS,
+			Timestamp:  event.FinishedAt,
+		})
 	}
 
 	s.logger.Debug("reposvc.SyncNow completed successfully",

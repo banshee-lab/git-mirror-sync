@@ -72,3 +72,15 @@ export interface ConnectionTestResult {
   pull: DirectionTestResult;
   push: DirectionTestResult;
 }
+
+export interface SyncSseEvent {
+  type: 'sync_started' | 'sync_completed' | 'sync_failed' | string;
+  event_id?: number;
+  repo_id?: number;
+  repo_name?: string;
+  status: 'running' | 'success' | 'error' | 'conflict' | 'skipped' | string;
+  detail?: string;
+  duration_ms?: number;
+  timestamp?: string;
+}
+

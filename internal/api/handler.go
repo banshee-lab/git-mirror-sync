@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"forgejo-sync/internal/auth"
+	"forgejo-sync/internal/events"
 	"forgejo-sync/internal/reposvc"
 	"forgejo-sync/internal/sshkeys"
 	"forgejo-sync/internal/store"
@@ -23,6 +26,7 @@ type Options struct {
 	RepoSvc    *reposvc.Service
 	KeyMgr     *sshkeys.Manager
 	Auth       *auth.Provider
+	Hub        *events.Hub
 	Logger     *slog.Logger
 }
 
@@ -189,14 +193,70 @@ func NewHandler(opts Options) http.Handler {
 			return
 		}
 		opts.Logger.Debug("api: POST /api/repositories/{id}/sync started", slog.Int64("id", id))
-		eventID, err := opts.RepoSvc.SyncNow(r.Context(), id)
+		if opts.RepoSvc == nil {
+			opts.Logger.Debug("api: POST /api/repositories/{id}/sync failed: reposvc unavailable")
+			writeJSON(w, http.StatusInternalServerError, apiError("reposvc_missing", "repository service is unavailable"))
+			return
+		}
+		eventID, err := opts.RepoSvc.SyncNowAsync(r.Context(), id)
 		if err != nil {
 			opts.Logger.Debug("api: POST /api/repositories/{id}/sync failed", slog.Int64("id", id), slog.Any("error", err))
 			writeJSON(w, http.StatusInternalServerError, apiError("sync_failed", err.Error()))
 			return
 		}
-		opts.Logger.Debug("api: POST /api/repositories/{id}/sync succeeded", slog.Int64("id", id), slog.Int64("event_id", eventID))
-		writeJSON(w, http.StatusAccepted, map[string]any{"event_id": eventID})
+		opts.Logger.Debug("api: POST /api/repositories/{id}/sync enqueued async", slog.Int64("id", id), slog.Int64("event_id", eventID))
+		writeJSON(w, http.StatusAccepted, map[string]any{"event_id": eventID, "repo_id": id, "status": "running"})
+	})
+	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			opts.Logger.Debug("api: GET /api/events streaming unsupported")
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		if opts.Hub == nil {
+			return
+		}
+
+		ch, unsubscribe := opts.Hub.Subscribe()
+		defer unsubscribe()
+
+		opts.Logger.Debug("api: SSE client connected to /api/events")
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				opts.Logger.Debug("api: SSE client disconnected from /api/events")
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w, ": keepalive\n\n")
+				flusher.Flush()
+			case evt, ok := <-ch:
+				if !ok {
+					return
+				}
+				data, err := json.Marshal(evt)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "event: sync\ndata: %s\n\n", data)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+		}
 	})
 	mux.HandleFunc("POST /api/repositories/test-connection", func(w http.ResponseWriter, r *http.Request) {
 		var req reposvc.TestConnectionRequest

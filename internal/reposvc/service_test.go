@@ -3,15 +3,17 @@ package reposvc
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"forgejo-sync/internal/gitsync"
+	"forgejo-sync/internal/history"
 	"forgejo-sync/internal/store"
 )
 
 type fakeRepoStore struct {
-	repos map[int64]store.Repository
+	repos  map[int64]store.Repository
 	byName map[string]store.Repository
 	nextID int64
 }
@@ -98,7 +100,7 @@ func (f *fakeRepoStore) ListByPullURL(ctx context.Context, normalizedPullURL str
 }
 
 type fakeKeyStore struct {
-	keys map[int64]store.SSHKey
+	keys   map[int64]store.SSHKey
 	nextID int64
 }
 
@@ -157,27 +159,85 @@ func (f *fakeEventStore) Create(ctx context.Context, event store.SyncEvent) (sto
 	return event, nil
 }
 
+func (f *fakeEventStore) Finish(ctx context.Context, id int64, status history.Status, detail string, commitAfter string, finishedAt time.Time) error {
+	for i := range f.events {
+		if f.events[i].ID == id {
+			f.events[i].Status = string(status)
+			f.events[i].Detail = detail
+			f.events[i].CommitAfter = commitAfter
+			f.events[i].FinishedAt = finishedAt
+			return nil
+		}
+	}
+	return nil
+}
+
+// fakeGit is safe for concurrent use. All state is guarded by mu, and
+// PushToRemote signals on "done" (non-blocking, buffered) so async tests can
+// wait deterministically instead of sleeping and racing on plain fields.
 type fakeGit struct {
+	mu         sync.Mutex
 	syncCalled bool
 	pushCalled bool
 	lastSync   gitsync.SyncOptions
 	lastPush   gitsync.PushOptions
+
+	done chan struct{}
+}
+
+func newFakeGit() *fakeGit {
+	return &fakeGit{done: make(chan struct{}, 1)}
 }
 
 func (f *fakeGit) SyncRepository(ctx context.Context, opts gitsync.SyncOptions) (string, error) {
+	f.mu.Lock()
 	f.syncCalled = true
 	f.lastSync = opts
+	f.mu.Unlock()
 	return opts.CacheDir, nil
 }
 
 func (f *fakeGit) PushToRemote(ctx context.Context, opts gitsync.PushOptions) (*gitsync.PushResult, error) {
+	f.mu.Lock()
 	f.pushCalled = true
 	f.lastPush = opts
+	f.mu.Unlock()
+
+	select {
+	case f.done <- struct{}{}:
+	default:
+	}
 	return &gitsync.PushResult{RawOutput: "ok"}, nil
 }
 
 func (f *fakeGit) LsRemote(ctx context.Context, remoteURL string, keyPath string, timeout time.Duration) error {
 	return nil
+}
+
+// Called reports whether SyncRepository/PushToRemote have been invoked so
+// far. Safe to call concurrently with the fake's own methods.
+func (f *fakeGit) Called() (syncCalled, pushCalled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncCalled, f.pushCalled
+}
+
+// LastCalls returns the most recently observed sync/push options.
+func (f *fakeGit) LastCalls() (gitsync.SyncOptions, gitsync.PushOptions) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastSync, f.lastPush
+}
+
+// waitDone blocks until PushToRemote has run at least once, or the timeout
+// elapses (failing the test). This replaces arbitrary sleeps in async tests.
+func (f *fakeGit) waitDone(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-f.done:
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for async git operations to complete")
+	}
 }
 
 func TestServiceCreateNormalizesURLsAndValidatesKeys(t *testing.T) {
@@ -187,8 +247,8 @@ func TestServiceCreateNormalizesURLsAndValidatesKeys(t *testing.T) {
 	key1, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull-key", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	key2, _ := keyStore.Create(ctx, store.SSHKey{Name: "push-key", PrivatePath: "push.pem", PublicPath: "push.pub"})
 	eventStore := &fakeEventStore{}
-	git := &fakeGit{}
-	service := NewService(repoStore, keyStore, eventStore, git, "/tmp/keys", "/tmp/cache", nil)
+	git := newFakeGit()
+	service := NewService(repoStore, keyStore, eventStore, git, "/tmp/keys", "/tmp/cache", nil, nil)
 
 	repo, err := service.Create(ctx, CreateRequest{
 		Name:          "demo-repo",
@@ -218,7 +278,7 @@ func TestServiceCreateRejectsInvalidURL(t *testing.T) {
 	keyStore := newFakeKeyStore()
 	key1, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull-key", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	key2, _ := keyStore.Create(ctx, store.SSHKey{Name: "push-key", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, newFakeGit(), "/tmp/keys", "/tmp/cache", nil, nil)
 
 	_, err := service.Create(ctx, CreateRequest{
 		Name:          "bad-repo",
@@ -239,9 +299,9 @@ func TestServiceSyncNowRecordsEvent(t *testing.T) {
 	keyStore := newFakeKeyStore()
 	pullKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	pushKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "push", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	git := &fakeGit{}
+	git := newFakeGit()
 	events := &fakeEventStore{}
-	service := NewService(repoStore, keyStore, events, git, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, events, git, "/tmp/keys", "/tmp/cache", nil, nil)
 
 	repo, _ := repoStore.Create(ctx, store.Repository{
 		Name:           "sync-me",
@@ -262,7 +322,8 @@ func TestServiceSyncNowRecordsEvent(t *testing.T) {
 	if eventID == 0 {
 		t.Fatal("expected event ID > 0")
 	}
-	if !git.syncCalled || !git.pushCalled {
+	syncCalled, pushCalled := git.Called()
+	if !syncCalled || !pushCalled {
 		t.Fatal("expected both git sync operations to run")
 	}
 	if len(events.events) != 1 {
@@ -273,13 +334,54 @@ func TestServiceSyncNowRecordsEvent(t *testing.T) {
 	}
 }
 
+func TestServiceSyncNowAsync(t *testing.T) {
+	ctx := context.Background()
+	repoStore := newFakeRepoStore()
+	keyStore := newFakeKeyStore()
+	pullKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
+	pushKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "push", PrivatePath: "push.pem", PublicPath: "push.pub"})
+	git := newFakeGit()
+	eventsStore := &fakeEventStore{}
+	service := NewService(repoStore, keyStore, eventsStore, git, "/tmp/keys", "/tmp/cache", nil, nil)
+
+	repo, _ := repoStore.Create(ctx, store.Repository{
+		Name:           "sync-async",
+		PullURLRaw:     "git@github.com:owner/repo",
+		PullURLSSH:     "ssh://git@github.com/owner/repo.git",
+		PullSSHKeyID:   pullKey.ID,
+		PushURLRaw:     "git@github.com:owner/target",
+		PushURLSSH:     "ssh://git@github.com/owner/target.git",
+		PushSSHKeyID:   pushKey.ID,
+		WebhookSecHash: "hash",
+		ProviderHint:   "github",
+	})
+
+	eventID, err := service.SyncNowAsync(ctx, repo.ID)
+	if err != nil {
+		t.Fatalf("SyncNowAsync() returned error: %v", err)
+	}
+	if eventID == 0 {
+		t.Fatal("expected event ID > 0")
+	}
+
+	// Wait deterministically for the background goroutine to finish its
+	// push, instead of sleeping (which races on fakeGit's fields and is
+	// also just flaky under load).
+	git.waitDone(t, 2*time.Second)
+
+	syncCalled, pushCalled := git.Called()
+	if !syncCalled || !pushCalled {
+		t.Fatal("expected async git sync operations to run")
+	}
+}
+
 func TestServiceUpdateKeepsHashWhenSecretUnchanged(t *testing.T) {
 	ctx := context.Background()
 	repoStore := newFakeRepoStore()
 	keyStore := newFakeKeyStore()
 	pullKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	pushKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "push", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, newFakeGit(), "/tmp/keys", "/tmp/cache", nil, nil)
 
 	repo, err := service.Create(ctx, CreateRequest{
 		Name:          "update-me",
@@ -317,8 +419,8 @@ func TestServiceCreateWithSyncNow(t *testing.T) {
 	keyStore := newFakeKeyStore()
 	pullKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	pushKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "push", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	git := &fakeGit{}
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, git, "/tmp/keys", "/tmp/cache", nil)
+	git := newFakeGit()
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, git, "/tmp/keys", "/tmp/cache", nil, nil)
 
 	_, err := service.Create(ctx, CreateRequest{
 		Name:          "sync-on-create",
@@ -332,7 +434,8 @@ func TestServiceCreateWithSyncNow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() with SyncNow returned error: %v", err)
 	}
-	if !git.syncCalled || !git.pushCalled {
+	syncCalled, pushCalled := git.Called()
+	if !syncCalled || !pushCalled {
 		t.Fatal("expected sync operations to run when SyncNow=true")
 	}
 }
@@ -343,7 +446,7 @@ func TestServiceCreateRejectsDuplicateName(t *testing.T) {
 	keyStore := newFakeKeyStore()
 	pullKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	pushKey, _ := keyStore.Create(ctx, store.SSHKey{Name: "push", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, newFakeGit(), "/tmp/keys", "/tmp/cache", nil, nil)
 
 	_, err := service.Create(ctx, CreateRequest{Name: "repo", PullURL: "git@github.com:owner/repo", PullSSHKeyID: pullKey.ID, PushURL: "git@github.com:owner/dest", PushSSHKeyID: pushKey.ID, WebhookSecret: "first"})
 	if err != nil {
@@ -359,7 +462,7 @@ func TestServiceListPagination(t *testing.T) {
 	ctx := context.Background()
 	repoStore := newFakeRepoStore()
 	keyStore := newFakeKeyStore()
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, newFakeGit(), "/tmp/keys", "/tmp/cache", nil, nil)
 
 	for i := 1; i <= 5; i++ {
 		_, _ = repoStore.Create(ctx, store.Repository{
@@ -388,7 +491,7 @@ func TestServicePushProviderHint(t *testing.T) {
 	keyStore := newFakeKeyStore()
 	key1, _ := keyStore.Create(ctx, store.SSHKey{Name: "pull-key", PrivatePath: "pull.pem", PublicPath: "pull.pub"})
 	key2, _ := keyStore.Create(ctx, store.SSHKey{Name: "push-key", PrivatePath: "push.pem", PublicPath: "push.pub"})
-	service := NewService(repoStore, keyStore, &fakeEventStore{}, &fakeGit{}, "/tmp/keys", "/tmp/cache", nil)
+	service := NewService(repoStore, keyStore, &fakeEventStore{}, newFakeGit(), "/tmp/keys", "/tmp/cache", nil, nil)
 
 	repo, err := service.Create(ctx, CreateRequest{
 		Name:          "provider-test",

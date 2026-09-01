@@ -1,16 +1,15 @@
 import { Component, Input, Output, EventEmitter, computed } from '@angular/core';
-
 @Component({
   selector: 'app-alert-banner',
   standalone: true,
   template: `
     @if (message) {
       <div
-        class="flex items-start gap-3 rounded-xl border p-4 text-sm transition-all"
+        class="flex items-center gap-3 rounded-xl border p-4 text-sm transition-all"
         [class]="containerClass()"
         role="alert"
       >
-        <i [class]="iconClass()" class="mt-0.5 shrink-0 text-base"></i>
+        <i [class]="iconClass()" class="shrink-0 text-base"></i>
         <div class="flex-1 break-words font-medium">
           {{ message }}
         </div>

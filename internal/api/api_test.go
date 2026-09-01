@@ -179,4 +179,25 @@ func TestAPIRoutes(t *testing.T) {
 			t.Errorf("expected 400 Bad Request, got %d", rec.Code)
 		}
 	})
+
+	t.Run("GET /api/events establishes SSE connection", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+
+		// Cancel context shortly after starting
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 OK, got %d", rec.Code)
+		}
+		if contentType := rec.Header().Get("Content-Type"); contentType != "text/event-stream" {
+			t.Errorf("expected Content-Type text/event-stream, got %s", contentType)
+		}
+	})
 }

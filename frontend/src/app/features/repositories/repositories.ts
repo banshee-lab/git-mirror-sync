@@ -6,6 +6,7 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { Subject, debounceTime, distinctUntilChanged, firstValueFrom } from 'rxjs';
 import { PagedResult, Repository } from '../../core/models';
+import { SyncEventsService } from '../../core/events/sync-events.service';
 import { getApiErrorMessage } from '../../core/http/api-error';
 import { ProviderIconComponent } from '../../shared/provider-icon/provider-icon.component';
 import { StatusBadgeComponent } from '../../shared/status-badge/status-badge.component';
@@ -31,6 +32,28 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
           Add repository
         </a>
       </div>
+
+      <!-- Active Sync Progress Bar -->
+      @if (hasActiveSyncs()) {
+        <div class="rounded-xl border border-emerald-500/30 bg-emerald-950/40 p-3.5 space-y-2">
+          <div class="flex items-center justify-between text-xs text-emerald-300">
+            <span class="flex items-center gap-2 font-medium">
+              <svg class="h-4 w-4 animate-spin text-emerald-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+              </svg>
+              Synchronizing repository in background&hellip;
+            </span>
+            <span class="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+              <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              LIVE
+            </span>
+          </div>
+          <div class="relative h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+            <div class="absolute inset-y-0 h-full rounded-full bg-emerald-400 animate-indeterminate"></div>
+          </div>
+        </div>
+      }
 
       <!-- Alerts -->
       <app-alert-banner [message]="successMsg()" type="success" />
@@ -69,6 +92,11 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
                     <div class="text-xs text-slate-500 mt-0.5 truncate max-w-[200px] md:max-w-xs lg:max-w-sm" [title]="repo.pull_url_ssh + ' → ' + repo.push_url_ssh">
                       {{ repo.pull_url_ssh }} &rarr; {{ repo.push_url_ssh }}
                     </div>
+                    @if (isSyncing(repo.id, repo.name)) {
+                      <div class="mt-2 relative h-1 w-full max-w-[200px] overflow-hidden rounded-full bg-slate-800">
+                        <div class="absolute inset-y-0 h-full rounded-full bg-emerald-400 animate-indeterminate"></div>
+                      </div>
+                    }
                   </td>
                   <td class="px-4 py-3">
                     @if (repo.last_sync_at) {
@@ -84,15 +112,15 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
                     </div>
                   </td>
                   <td class="px-4 py-3">
-                    <app-status-badge [status]="repo.last_sync_status || (repo.enabled ? 'live' : 'disabled')" />
+                    <app-status-badge [status]="isSyncing(repo.id, repo.name) ? 'running' : (repo.last_sync_status || (repo.enabled ? 'live' : 'disabled'))" />
                   </td>
                   <td class="px-4 py-3">
                     <div class="flex items-center justify-end gap-2">
                       <!-- Sync now -->
-                      <button (click)="syncNow(repo)" [disabled]="syncingId() === repo.id"
-                        title="Sync now"
+                      <button (click)="syncNow(repo)" [disabled]="isSyncing(repo.id, repo.name)"
+                        [title]="isSyncing(repo.id, repo.name) ? 'Sync in progress' : 'Sync now'"
                         class="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-400 transition-colors disabled:opacity-40">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" [class.animate-spin]="syncingId() === repo.id" viewBox="0 0 20 20" fill="currentColor">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" [class.animate-spin]="isSyncing(repo.id, repo.name)" viewBox="0 0 20 20" fill="currentColor">
                           <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/>
                         </svg>
                       </button>
@@ -156,13 +184,13 @@ export class RepositoriesComponent {
   private readonly http = inject(HttpClient);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
+  readonly syncEvents = inject(SyncEventsService);
 
   readonly repos = signal<Repository[]>([]);
   readonly loading = signal(true);
   readonly total = signal(0);
   readonly page = signal(1);
   readonly totalPages = signal(1);
-  readonly syncingId = signal<number | null>(null);
   readonly deletingId = signal<number | null>(null);
   readonly successMsg = signal('');
   readonly errorMsg = signal('');
@@ -195,8 +223,50 @@ export class RepositoriesComponent {
       this.searchQuery = params['q'] || '';
       const p = parseInt(params['page'], 10);
       this.page.set(isNaN(p) ? 1 : p);
-      this.loadRepositories();
+      this.loadRepositories(true);
     });
+
+    // Listen for real-time SSE events
+    this.syncEvents.events$.pipe(takeUntilDestroyed()).subscribe(event => {
+      const isFinished =
+        event.status === 'success' ||
+        event.status === 'error' ||
+        event.status === 'conflict' ||
+        event.status === 'skipped' ||
+        event.type === 'sync_completed' ||
+        event.type === 'sync_failed';
+
+      if (isFinished) {
+        if (event.status === 'success' || event.type === 'sync_completed') {
+          this.successMsg.set('Sync completed for ' + (event.repo_name || 'repository') + '.');
+        } else {
+          this.errorMsg.set(
+            'Sync failed for ' +
+              (event.repo_name || 'repository') +
+              (event.detail ? ': ' + event.detail : '')
+          );
+        }
+        // Refresh repositories table to reflect latest status and timestamps
+        void this.loadRepositories(false);
+      } else if (event.status === 'running' || event.type === 'sync_started') {
+        // Update status badge immediately for the running repo
+        this.repos.update(items =>
+          items.map(r =>
+            (event.repo_id && r.id === event.repo_id) || (event.repo_name && r.name === event.repo_name)
+              ? { ...r, last_sync_status: 'running' }
+              : r
+          )
+        );
+      }
+    });
+  }
+
+  isSyncing(repoId: number, repoName?: string): boolean {
+    return this.syncEvents.isSyncing(repoId, repoName);
+  }
+
+  hasActiveSyncs(): boolean {
+    return this.syncEvents.hasActiveSyncs();
   }
 
   onSearch(): void {
@@ -216,16 +286,14 @@ export class RepositoriesComponent {
   }
 
   async syncNow(repo: Repository): Promise<void> {
-    this.syncingId.set(repo.id);
-    this.successMsg.set('');
+    this.syncEvents.markSyncing(repo.id, repo.name);
+    this.successMsg.set('Sync triggered for ' + repo.name + '.');
     this.errorMsg.set('');
     try {
       await firstValueFrom(this.http.post('/api/repositories/' + repo.id + '/sync', {}));
-      this.successMsg.set('Sync triggered for ' + repo.name + '.');
     } catch (err) {
+      this.syncEvents.clearSyncing(repo.id, repo.name);
       this.errorMsg.set(getApiErrorMessage(err, 'Failed to trigger sync.'));
-    } finally {
-      this.syncingId.set(null);
     }
   }
 
@@ -240,7 +308,7 @@ export class RepositoriesComponent {
       if (this.repos().length === 1 && this.page() > 1) {
         this.router.navigate([], { queryParams: { page: this.page() - 1 }, queryParamsHandling: 'merge' });
       } else {
-        await this.loadRepositories();
+        await this.loadRepositories(true);
       }
     } catch (err) {
       this.errorMsg.set(getApiErrorMessage(err, 'Failed to delete repository.'));
@@ -249,8 +317,10 @@ export class RepositoriesComponent {
     }
   }
 
-  private async loadRepositories(): Promise<void> {
-    this.loading.set(true);
+  private async loadRepositories(showLoading = true): Promise<void> {
+    if (showLoading) {
+      this.loading.set(true);
+    }
     try {
       const params: Record<string, string> = {
         page: String(this.page()),
@@ -267,7 +337,10 @@ export class RepositoriesComponent {
       this.repos.set([]);
       this.errorMsg.set(getApiErrorMessage(err, 'Unable to load repositories.'));
     } finally {
-      this.loading.set(false);
+      if (showLoading) {
+        this.loading.set(false);
+      }
     }
   }
 }
+

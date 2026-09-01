@@ -33,6 +33,9 @@ export class StatusBadgeComponent {
       case 'disabled':
       case 'false':
         return 'Disabled';
+      case 'running':
+      case 'syncing':
+        return 'Running';
       case 'success':
         return 'Success';
       case 'conflict':
@@ -56,6 +59,9 @@ export class StatusBadgeComponent {
       case 'true':
       case 'success':
         return 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/20';
+      case 'running':
+      case 'syncing':
+        return 'bg-sky-500/15 text-sky-300 border border-sky-500/30';
       case 'conflict':
       case 'received':
         return 'bg-amber-500/15 text-amber-300 border border-amber-500/20';
@@ -77,6 +83,9 @@ export class StatusBadgeComponent {
       case 'true':
       case 'success':
         return 'bg-emerald-400';
+      case 'running':
+      case 'syncing':
+        return 'bg-sky-400 animate-pulse';
       case 'conflict':
       case 'received':
         return 'bg-amber-400';

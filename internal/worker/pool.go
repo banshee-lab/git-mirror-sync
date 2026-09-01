@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"forgejo-sync/internal/config"
+	"forgejo-sync/internal/events"
 	"forgejo-sync/internal/giturl"
 	"forgejo-sync/internal/gitsync"
 	"forgejo-sync/internal/history"
@@ -60,6 +61,7 @@ type Pool struct {
 	keyStore    SSHKeyStore
 	store       HistoryStore
 	gitSyncer   GitSyncer
+	hub         *events.Hub
 	jobCh       chan syncJob
 	repoLocks   map[int64]*sync.Mutex
 	repoLocksMu sync.Mutex
@@ -83,6 +85,11 @@ func New(cfg *config.Config, repoLookup RepoLookup, keyStore SSHKeyStore, store 
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+}
+
+// SetHub attaches an event hub for broadcasting real-time SSE events.
+func (p *Pool) SetHub(hub *events.Hub) {
+	p.hub = hub
 }
 
 // getRepoLock returns the mutex for a specific Forgejo repository ID, creating it if needed.
@@ -217,10 +224,39 @@ func (p *Pool) processJob(job syncJob) {
 	defer jobCancel()
 
 	start := time.Now()
+	if p.hub != nil {
+		p.hub.Publish(events.SyncEventPayload{
+			Type:      events.TypeSyncStarted,
+			EventID:   job.eventID,
+			RepoName:  job.repo.FullName,
+			Status:    string(history.StatusRunning),
+			Timestamp: start.UTC(),
+		})
+	}
 	defer func() {
-		err := p.store.Finish(context.Background(), job.eventID, status, detail, commitAfter, time.Now().UTC())
+		finishedAt := time.Now().UTC()
+		durationMS := finishedAt.Sub(start).Milliseconds()
+		if durationMS < 0 {
+			durationMS = 0
+		}
+		err := p.store.Finish(context.Background(), job.eventID, status, detail, commitAfter, finishedAt)
 		if err != nil {
 			slog.Error("failed to finish history row", slog.Int64("eventID", job.eventID), slog.Any("error", err))
+		}
+		if p.hub != nil {
+			evtType := events.TypeSyncCompleted
+			if status == history.StatusError || status == history.StatusConflict {
+				evtType = events.TypeSyncFailed
+			}
+			p.hub.Publish(events.SyncEventPayload{
+				Type:       evtType,
+				EventID:    job.eventID,
+				RepoName:   job.repo.FullName,
+				Status:     string(status),
+				Detail:     detail,
+				DurationMS: durationMS,
+				Timestamp:  finishedAt,
+			})
 		}
 		slog.Info("finished processing sync job",
 			slog.Int64("eventID", job.eventID),
