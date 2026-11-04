@@ -17,7 +17,7 @@ RUN go build -o /out/forgejo-sync ./cmd/forgejo-sync/
 
 FROM alpine:3.24
 RUN apk add --no-cache git openssh-client ca-certificates wget
-RUN addgroup -S git && adduser -S git -G git
+RUN addgroup -S git && adduser -S -h /home/git git -G git
 RUN mkdir -p /var/cache/forgejo-sync /var/cache/forgejo-sync/keys && chown -R git:git /var/cache/forgejo-sync
 USER git
 WORKDIR /home/git
