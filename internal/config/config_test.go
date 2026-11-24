@@ -196,3 +196,33 @@ func TestConfig_Load_InvalidValues(t *testing.T) {
 		}
 	}
 }
+
+func TestConfig_PublicURL(t *testing.T) {
+	t.Run("optional and trims trailing slash", func(t *testing.T) {
+		env := validEnvMap()
+		cfg, err := config.LoadFrom(func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PublicURL != "" {
+			t.Fatalf("expected empty PublicURL, got %q", cfg.PublicURL)
+		}
+
+		env["PUBLIC_URL"] = "https://sync.example.com/"
+		cfg, err = config.LoadFrom(func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.PublicURL != "https://sync.example.com" {
+			t.Fatalf("unexpected PublicURL %q", cfg.PublicURL)
+		}
+	})
+
+	t.Run("rejects invalid value", func(t *testing.T) {
+		env := validEnvMap()
+		env["PUBLIC_URL"] = "sync.example.com"
+		if _, err := config.LoadFrom(func(k string) string { return env[k] }); err == nil {
+			t.Fatal("expected error for invalid PUBLIC_URL")
+		}
+	})
+}

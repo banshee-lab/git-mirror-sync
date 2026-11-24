@@ -24,6 +24,15 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
           <h2 class="text-2xl font-semibold text-white">Repositories</h2>
           <p class="text-sm text-slate-400">Pull and push mirrors managed by this service.</p>
         </div>
+        <div class="flex items-center gap-2">
+        <button type="button" (click)="copyWebhookUrl()"
+          title="Copy the webhook URL to configure in GitHub/GitLab"
+          class="flex items-center gap-2 rounded-xl border border-slate-700 px-4 py-2 text-sm font-medium text-slate-300 hover:border-slate-500 hover:text-white transition-colors">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+            <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z"/><path d="M3 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v6h-4.586l1.293-1.293a1 1 0 00-1.414-1.414l-3 3a1 1 0 000 1.414l3 3a1 1 0 001.414-1.414L10.414 13H15v3a2 2 0 01-2 2H5a2 2 0 01-2-2V5zM15 11h2a1 1 0 110 2h-2v-2z"/>
+          </svg>
+          Copy webhook URL
+        </button>
         <a routerLink="/repositories/new"
           class="flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 hover:bg-emerald-400 transition-colors">
           <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
@@ -31,6 +40,7 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
           </svg>
           Add repository
         </a>
+        </div>
       </div>
 
       <!-- Active Sync Progress Bar -->
@@ -58,6 +68,7 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
       <!-- Alerts -->
       <app-alert-banner [message]="successMsg()" type="success" />
       <app-alert-banner [message]="errorMsg()" type="error" />
+      <app-alert-banner [message]="webhookHint()" type="info" [dismissible]="true" (dismiss)="webhookHint.set('')" />
 
       <!-- Search bar -->
       <div class="relative">
@@ -194,6 +205,8 @@ export class RepositoriesComponent {
   readonly deletingId = signal<number | null>(null);
   readonly successMsg = signal('');
   readonly errorMsg = signal('');
+  readonly webhookHint = signal('');
+  private webhookHintTimer: ReturnType<typeof setTimeout> | null = null;
 
   readonly pageSize = 20;
   searchQuery = '';
@@ -282,6 +295,26 @@ export class RepositoriesComponent {
   nextPage(): void {
     if (this.page() < this.totalPages()) {
       this.router.navigate([], { queryParams: { page: this.page() + 1 }, queryParamsHandling: 'merge' });
+    }
+  }
+
+  async copyWebhookUrl(): Promise<void> {
+    let url = window.location.origin + '/webhook';
+    try {
+      const cfg = await firstValueFrom(this.http.get<{ webhook_url?: string }>('/api/config'));
+      if (cfg?.webhook_url) url = cfg.webhook_url;
+    } catch {
+      // Fall back to the browser origin.
+    }
+
+    try {
+      await navigator.clipboard.writeText(url);
+      this.errorMsg.set('');
+      this.webhookHint.set('Webhook URL copied (' + url + '). Set the content type to application/json in the provider webhook settings.');
+      if (this.webhookHintTimer) clearTimeout(this.webhookHintTimer);
+      this.webhookHintTimer = setTimeout(() => this.webhookHint.set(''), 8000);
+    } catch {
+      this.errorMsg.set('Unable to copy to the clipboard. Webhook URL: ' + url);
     }
   }
 
