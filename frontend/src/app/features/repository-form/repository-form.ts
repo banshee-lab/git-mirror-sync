@@ -60,13 +60,13 @@ import { AlertBannerComponent } from '../../shared/alert-banner/alert-banner.com
                 <span class="text-sm text-slate-300">Enabled</span>
               </div>
               <div class="md:col-span-2">
-                <label class="mb-1 block text-sm text-slate-300">Webhook Secret <span class="text-rose-400">*</span></label>
+                <label class="mb-1 block text-sm text-slate-300">Webhook Secret @if (!isEdit) {<span class="text-rose-400">*</span>}</label>
                 <div class="flex gap-2">
                   <input formControlName="webhook_secret" type="text"
                     class="flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-emerald-400 focus:outline-none"
                     [class.border-slate-700]="!fieldError('webhook_secret')"
                     [class.border-rose-500]="fieldError('webhook_secret')"
-                    placeholder="Leave blank to keep existing or auto-generate" />
+                    [placeholder]="isEdit ? 'Leave blank to keep the current secret' : 'Enter a secret or click Generate'" />
                   <button type="button" (click)="generateSecret()"
                     class="rounded-xl border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors">
                     Generate
@@ -307,6 +307,10 @@ export class RepositoryFormComponent implements OnInit {
     if (id) {
       this.isEdit = true;
       this.repoId = parseInt(id, 10);
+      // On edit, an empty secret means "keep the existing one".
+      const secretCtrl = this.form.get('webhook_secret');
+      secretCtrl?.clearValidators();
+      secretCtrl?.updateValueAndValidity();
       await this.loadRepository(this.repoId);
     }
   }
