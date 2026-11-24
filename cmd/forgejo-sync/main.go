@@ -184,6 +184,7 @@ func run() error {
 		Auth:       authProvider,
 		Hub:        eventHub,
 		Logger:     logger,
+		PublicURL:  cfg.PublicURL,
 	})
 
 	// Create a single HTTP server for all routes

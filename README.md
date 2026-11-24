@@ -51,6 +51,9 @@ SSH_KEYS_DIR=/var/cache/forgejo-sync/keys
 WORKER_CONCURRENCY=4
 GIT_COMMAND_TIMEOUT=10m
 LOG_LEVEL=info
+# Optional: public base URL used to build the webhook URL shown in the UI (<PUBLIC_URL>/webhook).
+# If unset, the UI falls back to the browser origin.
+PUBLIC_URL=https://sync.example.com
 
 # Production OIDC settings (ignored in MODE=development)
 OIDC_ISSUER_URL=https://id.example.com

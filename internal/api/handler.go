@@ -28,6 +28,9 @@ type Options struct {
 	Auth       *auth.Provider
 	Hub        *events.Hub
 	Logger     *slog.Logger
+
+	// PublicURL is the externally reachable base URL (no trailing slash). Optional.
+	PublicURL string
 }
 
 // NewHandler returns the protected API router mounted under /api.
@@ -45,6 +48,13 @@ func NewHandler(opts Options) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, user)
+	})
+	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
+		webhookURL := ""
+		if opts.PublicURL != "" {
+			webhookURL = strings.TrimRight(opts.PublicURL, "/") + "/webhook"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"webhook_url": webhookURL})
 	})
 	mux.HandleFunc("GET /api/repositories", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")

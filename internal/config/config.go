@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,9 @@ type Config struct {
 	SessionCookieName string
 	SessionTTL        time.Duration
 
+	// PublicURL is the externally reachable base URL (e.g. https://sync.example.com)
+	// used to build the webhook URL shown in the UI. Optional.
+	PublicURL string
 }
 
 // Load reads and validates configuration from environment variables.
@@ -130,6 +134,16 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		}
 		cfg.SessionCookieName = getOptional("SESSION_COOKIE_NAME", "forgejo_sync_session")
 		cfg.SessionTTL = parseDuration("SESSION_TTL", 24*time.Hour)
+	}
+
+	// PUBLIC_URL (optional): base URL used to generate the webhook URL shown in the UI.
+	if raw := strings.TrimRight(strings.TrimSpace(getenv("PUBLIC_URL")), "/"); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("PUBLIC_URL must be a valid http(s) URL, got %q", raw))
+		} else {
+			cfg.PublicURL = raw
+		}
 	}
 
 	// Worker and git settings
